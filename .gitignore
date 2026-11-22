@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Build & Installer artifacts
+build/
+dist/
+installer/
+*.exe
+*.xlsx
+
+# IDE
+.vscode/
+.idea/
