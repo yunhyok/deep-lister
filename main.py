@@ -35,6 +35,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="중첩 압축파일을 풀 임시 폴더 (이번 실행에만 적용, 기본: 저장된 설정 또는 시스템 임시 폴더)",
     )
     parser.add_argument(
+        "--temp-limit-gb",
+        metavar="GB",
+        type=int,
+        help="임시 폴더에서 동시에 사용할 최대 용량(GB, 0=자동). 이번 실행에만 적용",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"{APP_NAME} {__version__}",
@@ -49,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         initial_paths=args.paths or None,
         log_dir=args.log_dir,
         temp_dir=args.temp_dir,
+        temp_limit_gb=args.temp_limit_gb,
     )
 
 

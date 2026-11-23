@@ -70,6 +70,8 @@ def test_export_to_excel_sheets_and_values(tmp_path: Path) -> None:
     assert summary["생성 날짜 없는 항목 수"] == f"{stats.created_missing:,} 개"
     assert summary["생성 시각 미저장 압축파일 수"] == "1 개"
     assert summary["ZIP 내부"] == "0 / 1 개"
+    assert summary["임시 공간 사용 한도"] != ""
+    assert summary["임시 공간 최대 사용량"].startswith("0 B (공간 대기 0 회)")
     assert stats.created_missing >= 1
     assert any(str(key).startswith("※ 생성 날짜가 빈 항목") for key in summary)
     wb.close()

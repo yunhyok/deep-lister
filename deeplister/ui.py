@@ -79,6 +79,8 @@ from .theme import apply_theme, assets_dir
 log = logging.getLogger("deeplister.ui")
 
 SETTINGS_KEY_TEMP_DIR = "scan/temp_dir"
+SETTINGS_KEY_TEMP_LIMIT_GB = "scan/temp_limit_gb"
+GIB = 1024**3
 
 
 class FileEntryTableModel(QAbstractTableModel):
@@ -439,9 +441,14 @@ class MainWindow(QMainWindow):
         # Remembers the temp folder between runs; None keeps everything in memory (tests)
         self._settings = settings
         self._temp_dir: str | None = None  # None = system temp folder
+        self._temp_limit_gb = 0  # 0 = automatic (most of the folder's free space)
         if settings is not None:
             saved = settings.value(SETTINGS_KEY_TEMP_DIR, "")
             self._temp_dir = str(saved) if saved else None
+            try:
+                self._temp_limit_gb = max(0, int(settings.value(SETTINGS_KEY_TEMP_LIMIT_GB, 0)))
+            except (TypeError, ValueError):
+                self._temp_limit_gb = 0
 
         self._input_paths: list[str] = []
         self._last_result: ScanResult | None = None
@@ -616,6 +623,22 @@ class MainWindow(QMainWindow):
         self.edit_temp_dir.setToolTip(temp_tip)
         self.lbl_temp_state = QLabel("")
         self.lbl_temp_state.setProperty("muted", True)
+        lbl_temp_limit = QLabel("최대 사용:")
+        lbl_temp_limit.setProperty("muted", True)
+        limit_tip = (
+            "임시 폴더에서 동시에 사용할 최대 용량입니다.\n"
+            "'자동'은 스캔을 시작할 때 여유 공간의 약 90%까지 사용합니다.\n"
+            "한도에 도달하면 먼저 푼 압축파일의 탐색이 끝나 공간이 비워질 때까지\n"
+            "기다렸다가 이어서 진행합니다."
+        )
+        lbl_temp_limit.setToolTip(limit_tip)
+        self.spin_temp_limit = QSpinBox()
+        self.spin_temp_limit.setRange(0, 1_000_000)
+        self.spin_temp_limit.setSpecialValueText("자동")
+        self.spin_temp_limit.setSuffix(" GB")
+        self.spin_temp_limit.setValue(self._temp_limit_gb)
+        self.spin_temp_limit.setToolTip(limit_tip)
+        self.spin_temp_limit.valueChanged.connect(self._on_temp_limit_changed)
         self.btn_temp_browse = QPushButton("변경...")
         self.btn_temp_browse.setToolTip("임시 폴더로 사용할 폴더를 선택합니다. 선택한 폴더는 다음 실행에도 유지됩니다.")
         self.btn_temp_browse.clicked.connect(self._choose_temp_dir)
@@ -630,6 +653,8 @@ class MainWindow(QMainWindow):
         temp_row.addWidget(self.lbl_temp_state)
         temp_row.addWidget(self.btn_temp_browse)
         temp_row.addWidget(self.btn_temp_reset)
+        temp_row.addWidget(lbl_temp_limit)
+        temp_row.addWidget(self.spin_temp_limit)
         opt_outer.addLayout(temp_row)
         self._refresh_temp_dir_ui()
 
@@ -925,6 +950,27 @@ class MainWindow(QMainWindow):
     def _reset_temp_dir(self) -> None:
         self.set_temp_dir(None)
 
+    def temp_limit_gb(self) -> int:
+        """Most temp space a scan may use at once, in GB; 0 means automatic."""
+        return self._temp_limit_gb
+
+    def set_temp_limit_gb(self, gigabytes: int, persist: bool = True) -> None:
+        self._temp_limit_gb = max(0, int(gigabytes))
+        if self.spin_temp_limit.value() != self._temp_limit_gb:
+            self.spin_temp_limit.blockSignals(True)
+            self.spin_temp_limit.setValue(self._temp_limit_gb)
+            self.spin_temp_limit.blockSignals(False)
+        if persist and self._settings is not None:
+            self._settings.setValue(SETTINGS_KEY_TEMP_LIMIT_GB, self._temp_limit_gb)
+            self._settings.sync()
+        log.info(
+            "임시 공간 한도 설정: %s",
+            f"{self._temp_limit_gb} GB" if self._temp_limit_gb else "자동",
+        )
+
+    def _on_temp_limit_changed(self, gigabytes: int) -> None:
+        self.set_temp_limit_gb(gigabytes)
+
     def _choose_temp_dir(self) -> None:
         if self._is_busy():
             return
@@ -971,6 +1017,7 @@ class MainWindow(QMainWindow):
         self.spin_threads.setEnabled(not busy)
         self.spin_depth.setEnabled(not busy and scan_arc_enabled)
         self.btn_temp_browse.setEnabled(not busy and scan_arc_enabled)
+        self.spin_temp_limit.setEnabled(not busy and scan_arc_enabled)
         self.btn_temp_reset.setEnabled(not busy and scan_arc_enabled and self._temp_dir is not None)
 
         logging_on = logsetup.current_log_path() is not None
@@ -1002,6 +1049,7 @@ class MainWindow(QMainWindow):
             max_archive_depth=self.spin_depth.value(),
             max_workers=self.spin_threads.value(),
             temp_dir=self._temp_dir,
+            max_temp_bytes=self._temp_limit_gb * GIB if self._temp_limit_gb > 0 else None,
         )
 
         self._is_scanning = True
@@ -1244,6 +1292,7 @@ def run_gui(
     initial_paths: list[str] | None = None,
     log_dir: str | None = None,
     temp_dir: str | None = None,
+    temp_limit_gb: int | None = None,
 ) -> int:
     """Launch the DeepLister Qt application."""
     app = QApplication.instance()
@@ -1262,6 +1311,8 @@ def run_gui(
         if temp_dir:
             # Command-line choice applies to this run only; the saved setting is left alone
             window.set_temp_dir(temp_dir, persist=False)
+        if temp_limit_gb is not None:
+            window.set_temp_limit_gb(temp_limit_gb, persist=False)
         if initial_paths:
             window.add_paths(initial_paths)
 
