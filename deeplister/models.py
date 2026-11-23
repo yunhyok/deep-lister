@@ -82,6 +82,8 @@ class ScanOptions:
     max_workers: int = 8
     max_memory_archive_bytes: int = 32 * 1024 * 1024  # 32 MB per-archive memory cap
     max_total_memory_bytes: int = 128 * 1024 * 1024  # 128 MB global queued memory cap
+    # Folder in which nested archives are unpacked; None = the system temp folder
+    temp_dir: str | None = None
 
 
 @dataclass

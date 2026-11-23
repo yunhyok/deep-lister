@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication
 
 from deeplister import logsetup
@@ -136,3 +139,121 @@ def test_gui_export_saves_scan_log_next_to_excel(tmp_path: Path) -> None:
         app.processEvents()
     finally:
         logsetup.stop_file_logging()
+
+
+def _scan_and_wait(app: QApplication, win: MainWindow) -> None:
+    win.start_scan()
+    win._scan_thread.wait(10_000)
+    app.processEvents()
+
+
+def test_gui_temp_dir_is_used_validated_and_remembered(tmp_path: Path) -> None:
+    app = _ensure_app()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with zipfile.ZipFile(data_dir / "bundle.zip", "w") as zf:
+        zf.writestr("a.txt", b"a")
+    work_dir = tmp_path / "임시 작업"  # non-ASCII and a space must survive the settings file
+    work_dir.mkdir()
+    settings_file = tmp_path / "settings.ini"
+
+    win = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
+    win.show()
+
+    # Default: the system temp folder, nothing to reset
+    assert win.temp_dir() is None
+    assert win.edit_temp_dir.text() == tempfile.gettempdir()
+    assert win.lbl_temp_state.text().startswith("기본값 · 여유 ")
+    assert not win.btn_temp_reset.isEnabled()
+
+    # An unusable folder is rejected and the previous choice stays
+    assert not win.set_temp_dir(str(tmp_path / "missing"))
+    assert win.temp_dir() is None
+
+    assert win.set_temp_dir(str(work_dir))
+    assert win.temp_dir() == str(work_dir)
+    assert win.edit_temp_dir.text() == str(work_dir)
+    assert win.lbl_temp_state.text().startswith("사용자 지정 · 여유 ")
+    assert win.btn_temp_reset.isEnabled()
+
+    # The choice reaches the scan
+    win.add_paths([str(data_dir)])
+    win.start_scan()
+    scan_thread = win._scan_thread
+    assert scan_thread._options.temp_dir == str(work_dir)
+    assert not win.btn_temp_browse.isEnabled()  # locked while scanning
+    scan_thread.wait(10_000)
+    app.processEvents()
+    assert win._last_result is not None
+    assert not win._last_result.warnings
+    assert list(work_dir.iterdir()) == []
+    win.close()
+    app.processEvents()
+
+    # ...and is remembered by the next window
+    reopened = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
+    assert reopened.temp_dir() == str(work_dir)
+    assert reopened.edit_temp_dir.text() == str(work_dir)
+
+    reopened.btn_temp_reset.click()
+    assert reopened.temp_dir() is None
+    assert reopened.edit_temp_dir.text() == tempfile.gettempdir()
+    reopened.close()
+    app.processEvents()
+
+    third = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
+    assert third.temp_dir() is None
+    third.close()
+    app.processEvents()
+
+
+def test_gui_saved_temp_dir_that_disappeared_falls_back_with_a_warning(tmp_path: Path) -> None:
+    app = _ensure_app()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with zipfile.ZipFile(data_dir / "bundle.zip", "w") as zf:
+        zf.writestr("a.txt", b"a")
+    gone = tmp_path / "unplugged_drive"
+
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("scan/temp_dir", str(gone))
+    settings.sync()
+
+    win = MainWindow(settings)
+    win.show()
+    assert win.temp_dir() == str(gone)  # kept: the drive may come back
+    assert "사용할 수 없음" in win.lbl_temp_state.text()
+
+    win.add_paths([str(data_dir)])
+    _scan_and_wait(app, win)
+    result = win._last_result
+    assert result is not None
+    assert "a.txt" in {e.name for e in result.entries}
+    assert any("지정한 임시 폴더를 사용할 수 없어" in w.reason for w in result.warnings)
+    win.close()
+    app.processEvents()
+
+
+def test_app_starts_and_exits_cleanly(tmp_path: Path) -> None:
+    """Qt teardown crashes happen at interpreter exit: only a separate process can observe them."""
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", LOCALAPPDATA=str(tmp_path / "appdata"))
+    main_script = Path(__file__).resolve().parent.parent / "main.py"
+
+    proc = subprocess.run(
+        [sys.executable, str(main_script), "--smoke-test", "--temp-dir", str(work_dir)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    logs = list((tmp_path / "appdata" / "DeepLister" / "logs").glob("DeepLister_*.log"))
+    assert len(logs) == 1
+    text = logs[0].read_text(encoding="utf-8-sig")
+    assert f"임시 폴더 설정: {work_dir}" in text
+    assert "세션 종료" in text
+    # A command-line temp folder applies to that run only and is not saved
+    assert not (tmp_path / "appdata" / "DeepLister" / "settings.ini").exists()
