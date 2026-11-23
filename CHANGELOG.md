@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.0] - 2026-11-24
+
+### 추가
+- **Cadence PowerSI `.spd` 내부 정보 자동 추출**: 폴더나 압축파일(`.zip`, `.7z`, `.tar` 계열 및 중첩 압축파일) 내부에 `.spd` 파일이 있으면 스트리밍 방식으로 내부를 읽어 다음 3가지 정보를 함께 추출합니다.
+  - **활성 NET 수**: `.NetList` ~ `.EndNetList` 구간에서 `::Unselected`가 아닌 모든 활성 NET(Signal/Power/Ground) 개수
+  - **Component Type 수**: `.PartialCkt` 및 `.Connect`에 등장하는 고유 Component Type 개수
+  - **RefDes 수**: `.Connect` 레코드(RefDes) 개수
+- Excel `파일 목록` 시트와 화면 결과 표에 `활성 NET 수`, `Component Type 수`, `RefDes 수` 열을 추가했습니다 (`.spd` 외 파일은 빈 칸으로 유지).
+- Excel `요약` 시트에 `SPD 분석 파일 수` 항목을 추가했습니다.
+- `.7z` 내부 `.spd` 파일도 임시 디스크나 전체 메모리 버퍼 없이 스트리밍으로 바로 분석합니다.
+
 ## [1.3.0] - 2026-11-23
 
 ### 추가

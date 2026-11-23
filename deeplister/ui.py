@@ -94,6 +94,9 @@ class FileEntryTableModel(QAbstractTableModel):
         "수정된 날짜",
         "용량 (Bytes)",
         "구분",
+        "활성 NET 수",
+        "Component Type 수",
+        "RefDes 수",
     )
 
     SORT_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -162,6 +165,16 @@ class FileEntryTableModel(QAbstractTableModel):
                 return f"{entry.size:,}"
             if col == 6:
                 return entry.kind_label
+            if col == 7:
+                return f"{entry.spd_active_nets:,}" if entry.spd_active_nets is not None else ""
+            if col == 8:
+                return (
+                    f"{entry.spd_component_types:,}"
+                    if entry.spd_component_types is not None
+                    else ""
+                )
+            if col == 9:
+                return f"{entry.spd_refdes_count:,}" if entry.spd_refdes_count is not None else ""
 
         if role == self.SORT_ROLE:
             if col == 0:
@@ -178,9 +191,15 @@ class FileEntryTableModel(QAbstractTableModel):
                 return entry.size
             if col == 6:
                 return entry.kind_label
+            if col == 7:
+                return entry.spd_active_nets if entry.spd_active_nets is not None else -1
+            if col == 8:
+                return entry.spd_component_types if entry.spd_component_types is not None else -1
+            if col == 9:
+                return entry.spd_refdes_count if entry.spd_refdes_count is not None else -1
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in (0, 5):
+            if col in (0, 5, 7, 8, 9):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             if col in (3, 4, 6):
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
@@ -786,7 +805,7 @@ class MainWindow(QMainWindow):
         hdr = self.table_view.horizontalHeader()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        col_widths = (55, 340, 210, 145, 145, 115, 125)
+        col_widths = (55, 320, 200, 145, 145, 110, 120, 95, 130, 95)
         for idx, width in enumerate(col_widths):
             self.table_view.setColumnWidth(idx, width)
 

@@ -51,6 +51,9 @@ class FileEntry:
     kind: EntryKind = EntryKind.FILE
     archive_depth: int = 0
     source: str = SOURCE_FILESYSTEM
+    spd_active_nets: int | None = None
+    spd_component_types: int | None = None
+    spd_refdes_count: int | None = None
 
     @property
     def kind_label(self) -> str:
@@ -116,6 +119,7 @@ class ScanStats:
     temp_limit_bytes: int | None = None
     temp_peak_bytes: int = 0
     temp_wait_count: int = 0
+    spd_files: int = 0
 
 
 @dataclass

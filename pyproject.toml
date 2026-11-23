@@ -1,6 +1,6 @@
 [project]
 name = "deep-lister"
-version = "1.3.0"
+version = "1.4.0"
 description = "Windows GUI tool to recursively list folders, files, and nested archives into Excel (.xlsx)"
 readme = "README.md"
 requires-python = ">=3.12"

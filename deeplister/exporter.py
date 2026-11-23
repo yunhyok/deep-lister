@@ -52,6 +52,9 @@ COLUMNS = [
     ("수정된 날짜", 21, 23, "center"),
     ("용량 (Bytes)", 15, 20, "right"),
     ("구분", 16, 26, "center"),
+    ("활성 NET 수", 14, 18, "right"),
+    ("Component Type 수", 20, 24, "right"),
+    ("RefDes 수", 13, 18, "right"),
 ]
 
 
@@ -123,6 +126,9 @@ def _compute_column_widths(entries: list[FileEntry]) -> list[int]:
             format_datetime(entry.modified_at),
             f"{entry.size:,}",
             entry.kind_label,
+            f"{entry.spd_active_nets:,}" if entry.spd_active_nets is not None else "",
+            f"{entry.spd_component_types:,}" if entry.spd_component_types is not None else "",
+            f"{entry.spd_refdes_count:,}" if entry.spd_refdes_count is not None else "",
         )
         for col_idx, text in enumerate(row_samples):
             w = _display_width(text) + 3
@@ -196,6 +202,27 @@ def _write_entries_sheets(wb: Workbook, entries: list[FileEntry]) -> None:
                     number_format="#,##0",
                 ),
                 _make_cell(ws, entry.kind_label, alignment=ALIGN_CENTER, fill=fill),
+                _make_cell(
+                    ws,
+                    entry.spd_active_nets,
+                    alignment=ALIGN_RIGHT,
+                    fill=fill,
+                    number_format="#,##0" if entry.spd_active_nets is not None else None,
+                ),
+                _make_cell(
+                    ws,
+                    entry.spd_component_types,
+                    alignment=ALIGN_RIGHT,
+                    fill=fill,
+                    number_format="#,##0" if entry.spd_component_types is not None else None,
+                ),
+                _make_cell(
+                    ws,
+                    entry.spd_refdes_count,
+                    alignment=ALIGN_RIGHT,
+                    fill=fill,
+                    number_format="#,##0" if entry.spd_refdes_count is not None else None,
+                ),
             ]
             ws.append(row_cells)
 
@@ -219,6 +246,7 @@ def _write_summary_sheet(wb: Workbook, result: ScanResult) -> None:
         ("탐색한 압축 파일 수", f"{stats.archives_scanned:,} 개"),
         ("압축 내부 파일 수", f"{stats.archive_members:,} 개"),
         ("빈 폴더 수", f"{stats.directories:,} 개"),
+        ("SPD 분석 파일 수", f"{stats.spd_files:,} 개"),
         ("생성 날짜 기록 항목 수", f"{stats.created_present:,} 개"),
         ("생성 날짜 없는 항목 수", f"{stats.created_missing:,} 개"),
         ("생성 시각 미저장 압축파일 수", f"{stats.archives_without_created:,} 개"),

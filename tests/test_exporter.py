@@ -35,8 +35,8 @@ def test_export_to_excel_sheets_and_values(tmp_path: Path) -> None:
     assert "경고 및 오류" in wb.sheetnames
 
     ws = wb["파일 목록"]
-    assert ws.max_column == 7
-    headers = [ws.cell(1, c).value for c in range(1, 8)]
+    assert ws.max_column == 10
+    headers = [ws.cell(1, c).value for c in range(1, 11)]
     assert headers == [
         "No.",
         "디렉토리 이름",
@@ -45,10 +45,13 @@ def test_export_to_excel_sheets_and_values(tmp_path: Path) -> None:
         "수정된 날짜",
         "용량 (Bytes)",
         "구분",
+        "활성 NET 수",
+        "Component Type 수",
+        "RefDes 수",
     ]
     assert ws.max_row == len(result.entries) + 1
     assert ws.freeze_panes == "A2"
-    assert ws.auto_filter.ref == f"A1:G{len(result.entries) + 1}"
+    assert ws.auto_filter.ref == f"A1:J{len(result.entries) + 1}"
 
     row_by_name = {ws.cell(r, 3).value: r for r in range(2, ws.max_row + 1)}
     alpha_row = row_by_name["alpha.txt"]

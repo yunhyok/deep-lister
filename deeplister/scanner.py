@@ -38,6 +38,7 @@ from .models import (
     ScanWarning,
     format_size,
 )
+from .spd import SpdCounter, SpdInfo, is_spd_file, parse_spd_file, parse_spd_stream
 
 log = logging.getLogger("deeplister.scanner")
 
@@ -380,6 +381,66 @@ class _Isolated7zWriterFactory(py7zr.io.WriterFactory):
                 w.close()
             except Exception:
                 pass
+
+
+class _ScanCancelled(Exception):
+    """Internal signal to abort streaming py7zr extraction when cancelled."""
+
+
+class _Spd7zIO(py7zr.io.Py7zIO):
+    """Stream 7z extracted .spd bytes straight into SpdCounter without disk or RAM buffering."""
+
+    def __init__(self, cancel_event: threading.Event) -> None:
+        self._cancel_event = cancel_event
+        self._counter = SpdCounter()
+        self._size = 0
+
+    def write(self, s: bytes | bytearray) -> int:
+        if self._cancel_event.is_set():
+            raise _ScanCancelled()
+        self._counter.feed(s)
+        n = len(s)
+        self._size += n
+        return n
+
+    def read(self, size: int | None = None) -> bytes:
+        return b""
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._size
+
+    def flush(self) -> None:
+        pass
+
+    def size(self) -> int:
+        return self._size
+
+    def close(self) -> None:
+        pass
+
+    def finish(self) -> SpdInfo:
+        return self._counter.finish()
+
+
+class _Spd7zWriterFactory(py7zr.io.WriterFactory):
+    """Create streaming _Spd7zIO writers keyed by 7z member filename."""
+
+    def __init__(self, cancel_event: threading.Event) -> None:
+        self._cancel_event = cancel_event
+        self.writers: dict[str, _Spd7zIO] = {}
+
+    def create(self, filename: str) -> py7zr.io.Py7zIO:
+        writer = _Spd7zIO(self._cancel_event)
+        self.writers[filename] = writer
+        return writer
+
+
+def _apply_spd_info(entry: FileEntry, info: SpdInfo | None) -> None:
+    if info is None:
+        return
+    entry.spd_active_nets = info.active_nets
+    entry.spd_component_types = info.component_types
+    entry.spd_refdes_count = info.refdes_count
 
 
 @dataclass(slots=True)
@@ -987,25 +1048,37 @@ class ScanEngine:
                     )
                 )
         else:
-            self._add_entries(
-                [
-                    FileEntry(
-                        directory=str(path.parent),
-                        name=path.name,
-                        created_at=created,
-                        modified_at=modified,
-                        size=st.st_size,
-                        kind=EntryKind.FILE,
-                        archive_depth=0,
-                    )
-                ],
-                current_path=str(path),
+            entry = FileEntry(
+                directory=str(path.parent),
+                name=path.name,
+                created_at=created,
+                modified_at=modified,
+                size=st.st_size,
+                kind=EntryKind.FILE,
+                archive_depth=0,
             )
+            if is_spd_file(path.name):
+                _apply_spd_info(entry, self._read_spd_file(path))
+            self._add_entries([entry], current_path=str(path))
             if archive_type == "unsupported_rar" and self.options.scan_archives:
                 self._add_warning(
                     str(path),
                     "RAR 형식은 내장 엔진에서 지원되지 않아 압축 파일 자체만 기록했습니다.",
                 )
+
+    def _read_spd_file(self, path: Path) -> SpdInfo | None:
+        try:
+            return parse_spd_file(path, cancel_event=self.cancel_event)
+        except Exception as exc:
+            self._add_warning(str(path), f"SPD 파일 분석 실패: {exc}", exc=exc)
+            return None
+
+    def _read_spd_stream(self, stream, display_path: str) -> SpdInfo | None:
+        try:
+            return parse_spd_stream(stream, cancel_event=self.cancel_event)
+        except Exception as exc:
+            self._add_warning(display_path, f"SPD 파일 분석 실패: {exc}", exc=exc)
+            return None
 
     def _scan_directory(self, dir_path: Path) -> None:
         local_entries: list[FileEntry] = []
@@ -1054,17 +1127,18 @@ class ScanEngine:
                                         )
                                     )
                             else:
-                                local_entries.append(
-                                    FileEntry(
-                                        directory=str(dir_path),
-                                        name=de.name,
-                                        created_at=created,
-                                        modified_at=modified,
-                                        size=st.st_size,
-                                        kind=EntryKind.FILE,
-                                        archive_depth=0,
-                                    )
+                                entry = FileEntry(
+                                    directory=str(dir_path),
+                                    name=de.name,
+                                    created_at=created,
+                                    modified_at=modified,
+                                    size=st.st_size,
+                                    kind=EntryKind.FILE,
+                                    archive_depth=0,
                                 )
+                                if is_spd_file(de.name):
+                                    _apply_spd_info(entry, self._read_spd_file(Path(de.path)))
+                                local_entries.append(entry)
                                 if (
                                     archive_type == "unsupported_rar"
                                     and self.options.scan_archives
@@ -1383,17 +1457,40 @@ class ScanEngine:
                                     exc=exc,
                                 )
                     else:
-                        local_entries.append(
-                            FileEntry(
-                                directory=directory,
-                                name=name,
-                                created_at=created,
-                                modified_at=modified,
-                                size=info.file_size,
-                                kind=EntryKind.ARCHIVE_MEMBER,
-                                archive_depth=task.depth,
-                            )
+                        entry = FileEntry(
+                            directory=directory,
+                            name=name,
+                            created_at=created,
+                            modified_at=modified,
+                            size=info.file_size,
+                            kind=EntryKind.ARCHIVE_MEMBER,
+                            archive_depth=task.depth,
                         )
+                        if is_spd_file(name):
+                            if info.flag_bits & 0x1:
+                                self._add_warning(
+                                    member_vpath,
+                                    "암호화된 ZIP 항목이어서 SPD 내부 정보를 읽을 수 없습니다.",
+                                )
+                            else:
+                                try:
+                                    with zf.open(info, "r") as member_stream:
+                                        _apply_spd_info(
+                                            entry, self._read_spd_stream(member_stream, member_vpath)
+                                        )
+                                except RuntimeError as exc:
+                                    self._add_warning(
+                                        member_vpath,
+                                        f"SPD 파일 읽기 실패(암호화 등): {exc}",
+                                        exc=exc,
+                                    )
+                                except Exception as exc:
+                                    self._add_warning(
+                                        member_vpath,
+                                        f"SPD 파일 읽기 실패: {exc}",
+                                        exc=exc,
+                                    )
+                        local_entries.append(entry)
                         if nested_type == "unsupported_rar":
                             self._add_warning(
                                 member_vpath,
@@ -1512,17 +1609,30 @@ class ScanEngine:
                                 exc=exc,
                             )
                     else:
-                        local_entries.append(
-                            FileEntry(
-                                directory=directory,
-                                name=name,
-                                created_at=created,
-                                modified_at=modified,
-                                size=member.size,
-                                kind=EntryKind.ARCHIVE_MEMBER,
-                                archive_depth=task.depth,
-                            )
+                        entry = FileEntry(
+                            directory=directory,
+                            name=name,
+                            created_at=created,
+                            modified_at=modified,
+                            size=member.size,
+                            kind=EntryKind.ARCHIVE_MEMBER,
+                            archive_depth=task.depth,
                         )
+                        if is_spd_file(name):
+                            try:
+                                extracted = tf.extractfile(member)
+                                if extracted is not None:
+                                    with extracted:
+                                        _apply_spd_info(
+                                            entry, self._read_spd_stream(extracted, member_vpath)
+                                        )
+                            except Exception as exc:
+                                self._add_warning(
+                                    member_vpath,
+                                    f"TAR 내부 SPD 파일 읽기 실패: {exc}",
+                                    exc=exc,
+                                )
+                        local_entries.append(entry)
                         if nested_type == "unsupported_rar":
                             self._add_warning(
                                 member_vpath,
@@ -1554,6 +1664,8 @@ class ScanEngine:
         non_empty_dirs: set[str] = set()
         # (raw_member_name, nested_type, member_vpath, uncompressed_size)
         nested_targets: list[tuple[str, str, str, int]] = []
+        # (raw_member_name, member_vpath, entry)
+        spd_targets: list[tuple[str, str, FileEntry]] = []
         has_ctime_property = False  # 7z header carries the optional creation-time property
         note = ""
 
@@ -1641,17 +1753,18 @@ class ScanEngine:
                                 )
                             nested_targets.append((raw_name, nested_type, member_vpath, size))
                         else:
-                            local_entries.append(
-                                FileEntry(
-                                    directory=directory,
-                                    name=name,
-                                    created_at=created,
-                                    modified_at=modified,
-                                    size=size,
-                                    kind=EntryKind.ARCHIVE_MEMBER,
-                                    archive_depth=task.depth,
-                                )
+                            entry = FileEntry(
+                                directory=directory,
+                                name=name,
+                                created_at=created,
+                                modified_at=modified,
+                                size=size,
+                                kind=EntryKind.ARCHIVE_MEMBER,
+                                archive_depth=task.depth,
                             )
+                            local_entries.append(entry)
+                            if is_spd_file(name):
+                                spd_targets.append((raw_name, member_vpath, entry))
                             if nested_type == "unsupported_rar":
                                 self._add_warning(
                                     member_vpath,
@@ -1694,17 +1807,21 @@ class ScanEngine:
                                 (fi.filename, nested_type, member_vpath, int(fi.uncompressed or 0))
                             )
                         else:
-                            local_entries.append(
-                                FileEntry(
-                                    directory=directory,
-                                    name=name,
-                                    created_at=None,
-                                    modified_at=dt,
-                                    size=fi.uncompressed,
-                                    kind=EntryKind.ARCHIVE_MEMBER,
-                                    archive_depth=task.depth,
-                                )
+                            entry = FileEntry(
+                                directory=directory,
+                                name=name,
+                                created_at=None,
+                                modified_at=dt,
+                                size=fi.uncompressed,
+                                kind=EntryKind.ARCHIVE_MEMBER,
+                                archive_depth=task.depth,
                             )
+                            local_entries.append(entry)
+                            if is_spd_file(name):
+                                spd_targets.append((fi.filename, member_vpath, entry))
+
+                if spd_targets and not self.cancel_event.is_set():
+                    self._extract_7z_spd(task, sz, spd_targets)
 
                 # Extract nested archive members via WriterFactory directly to UUID temp files
                 # (never writes raw archive paths to disk: immune to ../ traversal & Windows MAX_PATH)
@@ -1737,6 +1854,40 @@ class ScanEngine:
                     local_entries.append(entry)
 
         self._finish_archive(task, SOURCE_7Z, local_entries, note)
+
+    def _extract_7z_spd(
+        self,
+        task: _ArchiveTask,
+        sz: py7zr.SevenZipFile,
+        targets: list[tuple[str, str, FileEntry]],
+    ) -> None:
+        """Stream .spd members from a 7z archive directly into SpdCounter without temp files."""
+        factory = _Spd7zWriterFactory(self.cancel_event)
+        try:
+            sz.reset()
+            sz.extract(targets=[t[0] for t in targets], factory=factory)
+        except _ScanCancelled:
+            return
+        except py7zr.exceptions.PasswordRequired:
+            self._add_warning(
+                task.virtual_path,
+                "암호화된 7z 항목이 포함되어 SPD 내부 정보를 읽을 수 없습니다.",
+            )
+            return
+        except Exception as exc:
+            self._add_warning(
+                task.virtual_path,
+                f"7z 내부 SPD 파일 분석 오류: {exc}",
+                exc=exc,
+            )
+            return
+
+        for raw_name, member_vpath, entry in targets:
+            writer = factory.writers.get(raw_name)
+            if writer is None:
+                self._add_warning(member_vpath, "7z에서 SPD 파일을 읽지 못했습니다.")
+                continue
+            _apply_spd_info(entry, writer.finish())
 
     def _extract_7z_nested(
         self,
@@ -1875,8 +2026,11 @@ class ScanEngine:
         total_size = 0
         max_depth = 0
         created_present = 0
+        spd_files = 0
         by_source: dict[str, list[int]] = {}
         for e in self._entries:
+            if e.spd_active_nets is not None:
+                spd_files += 1
             counts = by_source.get(e.source)
             if counts is None:
                 counts = by_source[e.source] = [0, 0]
@@ -1923,4 +2077,5 @@ class ScanEngine:
             temp_limit_bytes=self._temp_limit,
             temp_peak_bytes=self._temp_peak,
             temp_wait_count=self._temp_wait_count,
+            spd_files=spd_files,
         )

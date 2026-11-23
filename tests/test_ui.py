@@ -52,9 +52,9 @@ def test_gui_scan_and_filter(tmp_path: Path) -> None:
     assert win.proxy_model.data(win.proxy_model.index(0, 0)) == "1"
     assert win.proxy_model.data(win.proxy_model.index(1, 0)) == "2"
 
-    # Size is shown once, in bytes: the duplicate human-readable column is gone
+    # Size is shown once, in bytes, followed by SPD metadata columns
     model = win.table_model
-    assert model.columnCount() == 7
+    assert model.columnCount() == 10
     assert list(FileEntryTableModel.HEADERS) == [
         "No.",
         "디렉토리 이름",
@@ -63,6 +63,9 @@ def test_gui_scan_and_filter(tmp_path: Path) -> None:
         "수정된 날짜",
         "용량 (Bytes)",
         "구분",
+        "활성 NET 수",
+        "Component Type 수",
+        "RefDes 수",
     ]
     member_row = next(r for r in range(2) if model.entry_at(r).name == "summary.txt")
     assert model.data(model.index(member_row, 5)) == "9"
