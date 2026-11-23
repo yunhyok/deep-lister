@@ -248,13 +248,26 @@ def _free_bytes(path: Path) -> int | None:
 
 
 def temp_dir_problem(path: str | Path) -> str | None:
-    """Return why a folder cannot serve as the temp work folder, or None when it can."""
+    """Return why a folder cannot serve as the temp work folder, or None when it can.
+
+    The probe creates its folder and file directly rather than through tempfile. On Windows,
+    tempfile retries a denied create up to os.TMP_MAX times when the folder exists, because
+    os.access() calls every existing folder writable there; with a folder the user may not
+    write to, that loop would freeze the caller (the UI thread).
+    """
     folder = Path(path)
     try:
         if not folder.is_dir():
             return "폴더가 없습니다."
-        with tempfile.TemporaryFile(dir=folder):
-            pass
+        probe = folder / f"deeplister_probe_{uuid.uuid4().hex}"
+        os.mkdir(probe)
+        try:
+            probe_file = probe / "probe.bin"
+            with open(probe_file, "wb"):
+                pass
+            os.unlink(probe_file)
+        finally:
+            os.rmdir(probe)
     except OSError as exc:
         return f"폴더에 쓸 수 없습니다: {exc}"
     return None
@@ -1003,6 +1016,8 @@ class ScanEngine:
                 for de in it:
                     if self.cancel_event.is_set():
                         return
+                    if self._is_own_work_folder(de):
+                        continue  # the temp folder lies inside a scan target
                     has_children = True
                     try:
                         if de.is_dir(follow_symlinks=False):
@@ -1083,6 +1098,16 @@ class ScanEngine:
             )
 
         self._add_entries(local_entries, current_path=str(dir_path))
+
+    def _is_own_work_folder(self, entry: os.DirEntry) -> bool:
+        """True for this scan's deeplister_* work folder, whose files must never be listed."""
+        root = self._temp_root
+        if root is None or entry.name != root.name:
+            return False
+        try:
+            return os.path.samefile(entry.path, root)
+        except OSError:
+            return False
 
     def _scan_archive(self, task: _ArchiveTask) -> None:
         if task.depth > self.options.max_archive_depth:

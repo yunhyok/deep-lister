@@ -471,4 +471,59 @@ def test_temp_dir_problem(tmp_path: Path) -> None:
     assert scanner_module.temp_dir_problem(tmp_path) is None
     assert scanner_module.temp_dir_problem(tmp_path / "missing") is not None
     assert scanner_module.temp_dir_problem(a_file) is not None
-    assert list(tmp_path.iterdir()) == [a_file]  # the probe file is removed
+    assert list(tmp_path.iterdir()) == [a_file]  # the probe is removed
+
+
+def test_temp_dir_probe_reports_a_denied_folder_at_once(tmp_path: Path, monkeypatch) -> None:
+    """A folder that exists but refuses new entries must not go through tempfile.
+
+    On Windows tempfile keeps retrying a denied create in an existing folder (up to
+    os.TMP_MAX times), which would freeze the window that runs this probe.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    real_mkdir = os.mkdir
+    attempts: list[str] = []
+
+    def _deny_inside_locked(path, *args, **kwargs):
+        if Path(path).parent == locked:
+            attempts.append(str(path))
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    def _tempfile_must_not_be_used(*args, **kwargs):
+        raise AssertionError("the probe went through tempfile")
+
+    monkeypatch.setattr(os, "mkdir", _deny_inside_locked)
+    for name in ("TemporaryFile", "NamedTemporaryFile", "mkstemp", "mkdtemp"):
+        monkeypatch.setattr(scanner_module.tempfile, name, _tempfile_must_not_be_used)
+
+    problem = scanner_module.temp_dir_problem(locked)
+
+    assert problem is not None and "폴더에 쓸 수 없습니다" in problem
+    assert len(attempts) == 1  # one attempt, no retry loop
+    assert list(locked.iterdir()) == []
+
+
+def test_temp_folder_inside_a_scan_target_is_not_listed(tmp_path: Path) -> None:
+    """The scan must not list (or descend into) its own work folder."""
+    for i in range(4):
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, "w") as zf:
+            zf.writestr(f"deep{i}.txt", b"x" * 100_000)
+        with py7zr.SevenZipFile(tmp_path / f"outer{i}.7z", "w") as sz:
+            sz.writestr(inner.getvalue(), "inner.zip")
+    work = tmp_path / "work"
+    work.mkdir()
+    expected = (
+        {f"outer{i}.7z" for i in range(4)} | {f"deep{i}.txt" for i in range(4)} | {"inner.zip", "work"}
+    )
+
+    for _attempt in range(5):  # the leak depended on timing
+        options = ScanOptions(max_workers=4, include_empty_dirs=True, temp_dir=str(work))
+        result = ScanEngine(options).scan([tmp_path])
+
+        assert not result.warnings, [w.reason for w in result.warnings]
+        assert {e.name for e in result.entries} == expected  # "work" itself counts as empty
+        assert not any("deeplister_" in e.directory for e in result.entries)
+        assert list(work.iterdir()) == []
