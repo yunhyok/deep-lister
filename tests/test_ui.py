@@ -160,7 +160,9 @@ def test_gui_temp_dir_is_used_validated_and_remembered(tmp_path: Path) -> None:
     win = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
     win.show()
 
-    # Default: the system temp folder, nothing to reset
+    # Default: the system temp folder, nothing to reset, automatic space limit
+    assert win.temp_limit_gb() == 0
+    assert win.spin_temp_limit.text() == "자동"
     assert win.temp_dir() is None
     assert win.edit_temp_dir.text() == tempfile.gettempdir()
     assert win.lbl_temp_state.text().startswith("기본값 · 여유 ")
@@ -176,12 +178,18 @@ def test_gui_temp_dir_is_used_validated_and_remembered(tmp_path: Path) -> None:
     assert win.lbl_temp_state.text().startswith("사용자 지정 · 여유 ")
     assert win.btn_temp_reset.isEnabled()
 
-    # The choice reaches the scan
+    win.spin_temp_limit.setValue(50)  # as typed by the user
+    assert win.temp_limit_gb() == 50
+    assert win.spin_temp_limit.text() == "50 GB"
+
+    # The choices reach the scan
     win.add_paths([str(data_dir)])
     win.start_scan()
     scan_thread = win._scan_thread
     assert scan_thread._options.temp_dir == str(work_dir)
+    assert scan_thread._options.max_temp_bytes == 50 * 1024**3
     assert not win.btn_temp_browse.isEnabled()  # locked while scanning
+    assert not win.spin_temp_limit.isEnabled()
     scan_thread.wait(10_000)
     app.processEvents()
     assert win._last_result is not None
@@ -190,19 +198,29 @@ def test_gui_temp_dir_is_used_validated_and_remembered(tmp_path: Path) -> None:
     win.close()
     app.processEvents()
 
-    # ...and is remembered by the next window
+    # ...and are remembered by the next window
     reopened = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
     assert reopened.temp_dir() == str(work_dir)
     assert reopened.edit_temp_dir.text() == str(work_dir)
+    assert reopened.temp_limit_gb() == 50
+    assert reopened.spin_temp_limit.value() == 50
 
     reopened.btn_temp_reset.click()
     assert reopened.temp_dir() is None
     assert reopened.edit_temp_dir.text() == tempfile.gettempdir()
+    reopened.spin_temp_limit.setValue(0)
+    reopened.add_paths([str(data_dir)])
+    reopened.start_scan()
+    scan_thread = reopened._scan_thread
+    assert scan_thread._options.max_temp_bytes is None  # automatic
+    scan_thread.wait(10_000)
+    app.processEvents()
     reopened.close()
     app.processEvents()
 
     third = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
     assert third.temp_dir() is None
+    assert third.temp_limit_gb() == 0
     third.close()
     app.processEvents()
 
@@ -242,7 +260,15 @@ def test_app_starts_and_exits_cleanly(tmp_path: Path) -> None:
     main_script = Path(__file__).resolve().parent.parent / "main.py"
 
     proc = subprocess.run(
-        [sys.executable, str(main_script), "--smoke-test", "--temp-dir", str(work_dir)],
+        [
+            sys.executable,
+            str(main_script),
+            "--smoke-test",
+            "--temp-dir",
+            str(work_dir),
+            "--temp-limit-gb",
+            "7",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -254,6 +280,7 @@ def test_app_starts_and_exits_cleanly(tmp_path: Path) -> None:
     assert len(logs) == 1
     text = logs[0].read_text(encoding="utf-8-sig")
     assert f"임시 폴더 설정: {work_dir}" in text
+    assert "임시 공간 한도 설정: 7 GB" in text
     assert "세션 종료" in text
-    # A command-line temp folder applies to that run only and is not saved
+    # Command-line temp settings apply to that run only and are not saved
     assert not (tmp_path / "appdata" / "DeepLister" / "settings.ini").exists()

@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -247,20 +248,50 @@ def _free_bytes(path: Path) -> int | None:
 
 
 def temp_dir_problem(path: str | Path) -> str | None:
-    """Return why a folder cannot serve as the temp work folder, or None when it can."""
+    """Return why a folder cannot serve as the temp work folder, or None when it can.
+
+    The probe creates its folder and file directly rather than through tempfile. On Windows,
+    tempfile retries a denied create up to os.TMP_MAX times when the folder exists, because
+    os.access() calls every existing folder writable there; with a folder the user may not
+    write to, that loop would freeze the caller (the UI thread).
+    """
     folder = Path(path)
     try:
         if not folder.is_dir():
             return "폴더가 없습니다."
-        with tempfile.TemporaryFile(dir=folder):
-            pass
+        probe = folder / f"deeplister_probe_{uuid.uuid4().hex}"
+        os.mkdir(probe)
+        try:
+            probe_file = probe / "probe.bin"
+            with open(probe_file, "wb"):
+                pass
+            os.unlink(probe_file)
+        finally:
+            os.rmdir(probe)
     except OSError as exc:
         return f"폴더에 쓸 수 없습니다: {exc}"
     return None
 
 
 # Appended to disk-space warnings: the fix is in the user's hands
-_TEMP_DIR_HINT = "옵션의 '임시 폴더'를 여유 공간이 큰 드라이브로 바꾼 뒤 다시 스캔하세요."
+_TEMP_DIR_HINT = (
+    "옵션의 '임시 폴더'를 여유 공간이 큰 드라이브로 바꾸거나 '최대 사용' 한도를 늘린 뒤 "
+    "다시 스캔하세요."
+)
+
+# Automatic temp budget: leave about 10% of the free space (at least 256 MiB) untouched
+_TEMP_MARGIN_MIN = 256 * 1024 * 1024
+
+# How many archives one worker may scan on top of another while it waits for temp space
+_MAX_HELP_DEPTH = 8
+
+
+def auto_temp_limit(free_bytes: int | None) -> int | None:
+    """Temp budget used when the user sets none: most of the free space, None if unknown."""
+    if free_bytes is None:
+        return None
+    margin = min(max(free_bytes // 10, _TEMP_MARGIN_MIN), free_bytes // 2)
+    return max(0, free_bytes - margin)
 
 
 def _normalize_member_relpath(member_name: str) -> str:
@@ -377,11 +408,21 @@ class _ArchiveTask:
     source_bytes: bytes | None = None
     memory_charge: int = 0
     cleanup_path: Path | None = None
+    temp_charge: int = 0  # bytes of the temp budget held until this archive has been scanned
     started: float = 0.0
 
 
 class ScanEngine:
-    """Multi-threaded deadlock-free scanner for folders, files, and nested archives."""
+    """Multi-threaded deadlock-free scanner for folders, files, and nested archives.
+
+    Temp disk budget
+    ----------------
+    A nested archive that is unpacked to the temp folder holds part of a global budget until
+    it has been scanned and deleted. A worker that needs space while the budget is exhausted
+    waits for it, and meanwhile scans queued nested archives itself: finishing those is the
+    only thing that frees space, so a pool in which every worker merely waited would hang.
+    It gives up (with a warning) only when no one can free the space any more.
+    """
 
     def __init__(
         self,
@@ -411,6 +452,21 @@ class ScanEngine:
         self._start_time = 0.0
         self._temp_root: Path | None = None
 
+        # Temp disk budget (see class docstring); everything below is guarded by _temp_lock
+        self._temp_lock = threading.Lock()
+        self._temp_cond = threading.Condition(self._temp_lock)
+        self._temp_tasks: deque[_ArchiveTask] = deque()  # queued archives holding temp files
+        self._temp_limit: int | None = None  # None = unlimited
+        self._temp_used = 0
+        self._temp_peak = 0
+        self._temp_wait_count = 0
+        # Bumped whenever space is freed or an archive that would free space is queued.
+        # A waiter is "settled" once it has looked at the current epoch and still cannot go on.
+        self._temp_epoch = 0
+        self._temp_settled_waiters = 0
+        self._busy_workers = 0  # workers that have a task in progress
+        self._tls = threading.local()  # per thread: budget held by its task stack, help depth
+
     def scan(self, input_paths: list[str | Path]) -> ScanResult:
         """Scan all provided files, folders, and archives recursively using worker threads."""
         self._start_time = time.perf_counter()
@@ -423,6 +479,16 @@ class ScanEngine:
         self._max_depth_seen = 0
         self._current_path = ""
         self._done_event.clear()
+
+        with self._temp_lock:
+            self._temp_tasks.clear()
+            self._temp_limit = None
+            self._temp_used = 0
+            self._temp_peak = 0
+            self._temp_wait_count = 0
+            self._temp_epoch = 0
+            self._temp_settled_waiters = 0
+            self._busy_workers = 0
 
         # Reset queue/accounting state so ScanEngine instances are safely reusable
         with self._pending_lock:
@@ -468,10 +534,12 @@ class ScanEngine:
         with tempfile.TemporaryDirectory(prefix="deeplister_", dir=temp_parent) as temp_dir:
             self._temp_root = Path(temp_dir)
             free = _free_bytes(self._temp_root)
+            self._temp_limit = self._effective_temp_limit(free)
             log.info(
-                "임시 작업 폴더: %s (여유 공간 %s)",
+                "임시 작업 폴더: %s (여유 공간 %s, 사용 한도 %s)",
                 temp_dir,
                 format_size(free) if free is not None else "알 수 없음",
+                format_size(self._temp_limit) if self._temp_limit is not None else "제한 없음",
             )
 
             for p in unique_paths:
@@ -538,16 +606,31 @@ class ScanEngine:
         with self._pending_lock:
             self._queued_bytes = max(0, self._queued_bytes - nbytes)
 
+    def _effective_temp_limit(self, free_bytes: int | None) -> int | None:
+        """Budget for this scan: the user's limit, never more than the disk can hold."""
+        auto = auto_temp_limit(free_bytes)
+        user = self.options.max_temp_bytes
+        if user is not None and user > 0:
+            return user if auto is None else min(user, auto)
+        return auto
+
     def _enqueue(self, task: _DirTask | _ArchiveTask) -> None:
         if self.cancel_event.is_set():
             if isinstance(task, _ArchiveTask):
                 self._release_memory(task.memory_charge)
                 if task.cleanup_path is not None:
                     self._safe_cleanup(task.cleanup_path)
+                self._release_temp(task.temp_charge)
             return
         with self._pending_lock:
             self._pending_count += 1
-        self._task_queue.put(task)
+        if isinstance(task, _ArchiveTask) and task.temp_charge > 0:
+            # Scanned before anything else: finishing it gives temp space back
+            with self._temp_cond:
+                self._temp_tasks.append(task)
+                self._temp_changed()
+        else:
+            self._task_queue.put(task)
 
     def _finish_task(self) -> None:
         with self._pending_lock:
@@ -555,29 +638,173 @@ class ScanEngine:
             if self._pending_count <= 0:
                 self._done_event.set()
 
+    def _next_task(self) -> _DirTask | _ArchiveTask | None:
+        """Take the next task and mark this worker busy; archives holding temp files first."""
+        with self._temp_lock:
+            if self._temp_tasks:
+                self._busy_workers += 1
+                return self._temp_tasks.popleft()
+        try:
+            task = self._task_queue.get(timeout=0.05)
+        except queue.Empty:
+            return None
+        with self._temp_lock:
+            self._busy_workers += 1
+        return task
+
     def _worker_loop(self) -> None:
         while not self._done_event.is_set() and not self.cancel_event.is_set():
-            try:
-                task = self._task_queue.get(timeout=0.05)
-            except queue.Empty:
+            task = self._next_task()
+            if task is None:
                 continue
-
             try:
-                if not self.cancel_event.is_set():
-                    if isinstance(task, _DirTask):
-                        self._scan_directory(task.path)
-                    else:
-                        self._scan_archive(task)
-            except Exception as exc:
-                target = str(task.path) if isinstance(task, _DirTask) else task.virtual_path
-                self._add_warning(target, self._describe_error("처리 중 오류", exc), exc=exc)
+                self._run_task(task)
             finally:
-                if isinstance(task, _ArchiveTask):
-                    self._release_memory(task.memory_charge)
-                    task.source_bytes = None
-                    if task.cleanup_path is not None:
-                        self._safe_cleanup(task.cleanup_path)
-                self._finish_task()
+                with self._temp_cond:
+                    self._busy_workers -= 1
+                    self._temp_cond.notify_all()  # waiters re-check whether anyone can still help
+
+    def _run_task(self, task: _DirTask | _ArchiveTask) -> None:
+        """Scan one task and release everything it held (also used while waiting for space)."""
+        held_before = getattr(self._tls, "held", 0)
+        if isinstance(task, _ArchiveTask):
+            self._tls.held = held_before + task.temp_charge
+        try:
+            if not self.cancel_event.is_set():
+                if isinstance(task, _DirTask):
+                    self._scan_directory(task.path)
+                else:
+                    self._scan_archive(task)
+        except Exception as exc:
+            target = str(task.path) if isinstance(task, _DirTask) else task.virtual_path
+            self._add_warning(target, self._describe_error("처리 중 오류", exc), exc=exc)
+        finally:
+            self._tls.held = held_before
+            if isinstance(task, _ArchiveTask):
+                self._release_memory(task.memory_charge)
+                task.source_bytes = None
+                if task.cleanup_path is not None:
+                    self._safe_cleanup(task.cleanup_path)
+                self._release_temp(task.temp_charge)  # after the file is really gone
+            self._finish_task()
+
+    def _temp_changed(self) -> None:
+        """Start a new epoch: every waiter must look again. Caller holds _temp_lock."""
+        self._temp_epoch += 1
+        self._temp_settled_waiters = 0
+        self._temp_cond.notify_all()
+
+    def _reserve_temp(self, nbytes: int) -> bool:
+        """Reserve temp disk space, waiting for other archives to be finished if necessary.
+
+        While it waits, the worker scans queued archives that hold temp files, because
+        finishing them is what frees space. Returns False when the scan was cancelled or the
+        space can never become available: the request exceeds what this worker could ever
+        get, or every busy worker has seen the current state and is waiting too.
+        """
+        if nbytes <= 0:
+            return True
+        limit = self._temp_limit
+        if limit is not None and getattr(self._tls, "held", 0) + nbytes > limit:
+            return False  # even with all other archives finished it would not fit
+
+        help_depth = getattr(self._tls, "help_depth", 0)
+        wait_started: float | None = None
+        settled_epoch = -1  # epoch in which this thread is counted as a settled waiter
+
+        def unsettle() -> None:
+            nonlocal settled_epoch
+            if settled_epoch == self._temp_epoch:
+                self._temp_settled_waiters -= 1
+            settled_epoch = -1
+
+        with self._temp_cond:
+            while True:
+                if self.cancel_event.is_set():
+                    unsettle()
+                    return False
+                if limit is None or self._temp_used + nbytes <= limit:
+                    unsettle()
+                    self._temp_used += nbytes
+                    if self._temp_used > self._temp_peak:
+                        self._temp_peak = self._temp_used
+                    break
+
+                if wait_started is None:
+                    wait_started = time.perf_counter()
+                    self._temp_wait_count += 1
+                    log.info(
+                        "임시 공간 대기: 필요 %s | 사용 중 %s / 한도 %s",
+                        format_size(nbytes),
+                        format_size(self._temp_used),
+                        format_size(limit),
+                    )
+
+                if help_depth < _MAX_HELP_DEPTH and self._temp_tasks:
+                    helped = self._temp_tasks.popleft()
+                    unsettle()
+                    self._temp_cond.release()
+                    try:
+                        self._tls.help_depth = help_depth + 1
+                        try:
+                            self._run_task(helped)
+                        finally:
+                            self._tls.help_depth = help_depth
+                    finally:
+                        self._temp_cond.acquire()
+                    continue
+
+                if settled_epoch != self._temp_epoch:
+                    settled_epoch = self._temp_epoch
+                    self._temp_settled_waiters += 1
+                if self._temp_settled_waiters >= self._busy_workers:
+                    # Every busy worker has seen this state and waits: nobody is left to
+                    # free space, so waiting any longer would hang the scan
+                    unsettle()
+                    log.info(
+                        "임시 공간 확보 포기: 필요 %s | 사용 중 %s / 한도 %s (공간을 비울 작업이 없음)",
+                        format_size(nbytes),
+                        format_size(self._temp_used),
+                        format_size(limit),
+                    )
+                    return False
+
+                self._temp_cond.wait(timeout=0.2)
+
+        if wait_started is not None:
+            log.info(
+                "임시 공간 확보: %s | 대기 %.1f초",
+                format_size(nbytes),
+                time.perf_counter() - wait_started,
+            )
+        return True
+
+    def _charge_temp(self, nbytes: int) -> None:
+        """Account for temp space that is already on disk, without waiting."""
+        if nbytes <= 0:
+            return
+        with self._temp_lock:
+            self._temp_used += nbytes
+            if self._temp_used > self._temp_peak:
+                self._temp_peak = self._temp_used
+
+    def _release_temp(self, nbytes: int) -> None:
+        if nbytes <= 0:
+            return
+        with self._temp_cond:
+            self._temp_used = max(0, self._temp_used - nbytes)
+            self._temp_changed()
+
+    def _temp_shortage_text(self, count: int, needed: int) -> str:
+        """Warning text for nested archives skipped because the temp budget cannot hold them."""
+        limit = self._temp_limit
+        folder = self._temp_root.parent if self._temp_root is not None else tempfile.gettempdir()
+        return (
+            f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
+            f"(필요 {format_size(needed)}, 사용 한도 "
+            f"{format_size(limit) if limit is not None else '제한 없음'}, 임시 폴더: {folder}). "
+            f"{_TEMP_DIR_HINT}"
+        )
 
     def _safe_cleanup(self, path: Path) -> None:
         try:
@@ -689,6 +916,16 @@ class ScanEngine:
         )
         for source, (present, total) in stats.created_by_source.items():
             log.info("  %s: 생성 날짜 %d / %d", SOURCE_LABELS.get(source, source), present, total)
+        log.info(
+            "임시 공간: 한도 %s | 최대 사용 %s | 대기 %d회",
+            format_size(stats.temp_limit_bytes)
+            if stats.temp_limit_bytes is not None
+            else "제한 없음",
+            format_size(stats.temp_peak_bytes),
+            stats.temp_wait_count,
+        )
+        if self._temp_used and not stats.cancelled:
+            log.warning("임시 공간 정산 불일치: 스캔 종료 후에도 %d바이트가 사용 중으로 남음", self._temp_used)
 
     def _emit_progress(self, force: bool = False) -> None:
         if self.progress_callback is None:
@@ -779,6 +1016,8 @@ class ScanEngine:
                 for de in it:
                     if self.cancel_event.is_set():
                         return
+                    if self._is_own_work_folder(de):
+                        continue  # the temp folder lies inside a scan target
                     has_children = True
                     try:
                         if de.is_dir(follow_symlinks=False):
@@ -860,6 +1099,16 @@ class ScanEngine:
 
         self._add_entries(local_entries, current_path=str(dir_path))
 
+    def _is_own_work_folder(self, entry: os.DirEntry) -> bool:
+        """True for this scan's deeplister_* work folder, whose files must never be listed."""
+        root = self._temp_root
+        if root is None or entry.name != root.name:
+            return False
+        try:
+            return os.path.samefile(entry.path, root)
+        except OSError:
+            return False
+
     def _scan_archive(self, task: _ArchiveTask) -> None:
         if task.depth > self.options.max_archive_depth:
             self._add_warning(
@@ -911,6 +1160,7 @@ class ScanEngine:
             actual_size = 0
             spilled_path: Path | None = None
             spilled_fp = None
+            spilled_bytes = 0  # temp budget charged for the spilled file
             try:
                 while True:
                     if self.cancel_event.is_set():
@@ -919,6 +1169,7 @@ class ScanEngine:
                         if spilled_path is not None:
                             self._safe_cleanup(spilled_path)
                         self._release_memory(reserved)
+                        self._release_temp(spilled_bytes)
                         return
                     chunk = stream.read(1024 * 1024)
                     if not chunk:
@@ -934,16 +1185,22 @@ class ScanEngine:
                             spilled_fp.write(chunk)
                             self._release_memory(reserved)
                             reserved = 0
+                            # Larger than declared: already on disk, so account for it as it grows
+                            self._charge_temp(actual_size)
+                            spilled_bytes = actual_size
                         else:
                             chunks.append(chunk)
                     else:
                         spilled_fp.write(chunk)
+                        self._charge_temp(len(chunk))
+                        spilled_bytes += len(chunk)
             except Exception:
                 if spilled_fp is not None:
                     spilled_fp.close()
                 if spilled_path is not None:
                     self._safe_cleanup(spilled_path)
                 self._release_memory(reserved)
+                self._release_temp(spilled_bytes)
                 raise
             finally:
                 if spilled_fp is not None and not spilled_fp.closed:
@@ -957,6 +1214,7 @@ class ScanEngine:
                         depth=next_depth,
                         source_path=spilled_path,
                         cleanup_path=spilled_path,
+                        temp_charge=spilled_bytes,
                     )
                 )
             else:
@@ -981,21 +1239,36 @@ class ScanEngine:
         else:
             if self._temp_root is None:
                 return
+            # The declared size is an upper bound: zipfile and tarfile never yield more
+            charged = max(declared_size, 0)
+            if not self._reserve_temp(charged):
+                if not self.cancel_event.is_set():
+                    self._add_warning(nested_virtual_path, self._temp_shortage_text(1, charged))
+                return
             spilled_path = self._temp_root / f"nested_{uuid.uuid4().hex}.bin"
+            written = 0
             try:
                 with open(spilled_path, "wb") as out_fp:
                     while True:
                         if self.cancel_event.is_set():
                             out_fp.close()
                             self._safe_cleanup(spilled_path)
+                            self._release_temp(charged)
                             return
                         chunk = stream.read(1024 * 1024)
                         if not chunk:
                             break
                         out_fp.write(chunk)
+                        written += len(chunk)
             except Exception:
                 self._safe_cleanup(spilled_path)
+                self._release_temp(charged)
                 raise
+
+            if written < charged:
+                self._release_temp(charged - written)
+            elif written > charged:
+                self._charge_temp(written - charged)
 
             self._enqueue(
                 _ArchiveTask(
@@ -1004,6 +1277,7 @@ class ScanEngine:
                     depth=next_depth,
                     source_path=spilled_path,
                     cleanup_path=spilled_path,
+                    temp_charge=written,
                 )
             )
 
@@ -1278,8 +1552,8 @@ class ScanEngine:
         local_entries: list[FileEntry] = []
         candidate_dirs: dict[str, FileEntry] = {}
         non_empty_dirs: set[str] = set()
-        nested_targets: list[tuple[str, str, str]] = []  # (raw_member_name, nested_type, member_vpath)
-        nested_bytes = 0  # uncompressed size the nested archives need in the temp folder
+        # (raw_member_name, nested_type, member_vpath, uncompressed_size)
+        nested_targets: list[tuple[str, str, str, int]] = []
         has_ctime_property = False  # 7z header carries the optional creation-time property
         note = ""
 
@@ -1365,8 +1639,7 @@ class ScanEngine:
                                         archive_depth=task.depth,
                                     )
                                 )
-                            nested_targets.append((raw_name, nested_type, member_vpath))
-                            nested_bytes += size
+                            nested_targets.append((raw_name, nested_type, member_vpath, size))
                         else:
                             local_entries.append(
                                 FileEntry(
@@ -1417,8 +1690,9 @@ class ScanEngine:
                                         archive_depth=task.depth,
                                     )
                                 )
-                            nested_targets.append((fi.filename, nested_type, member_vpath))
-                            nested_bytes += int(fi.uncompressed or 0)
+                            nested_targets.append(
+                                (fi.filename, nested_type, member_vpath, int(fi.uncompressed or 0))
+                            )
                         else:
                             local_entries.append(
                                 FileEntry(
@@ -1436,65 +1710,13 @@ class ScanEngine:
                 # (never writes raw archive paths to disk: immune to ../ traversal & Windows MAX_PATH)
                 if nested_targets and not self.cancel_event.is_set():
                     if task.depth + 1 > self.options.max_archive_depth:
-                        for _, _, member_vpath in nested_targets:
+                        for _, _, member_vpath, _ in nested_targets:
                             self._add_warning(
                                 member_vpath,
                                 f"최대 압축 중첩 깊이({self.options.max_archive_depth})를 초과하여 탐색을 중단했습니다.",
                             )
-                    elif self._temp_root is not None and self._temp_space_ok(
-                        task, len(nested_targets), nested_bytes
-                    ):
-                        factory = _Isolated7zWriterFactory(self._temp_root)
-                        target_names = [t[0] for t in nested_targets]
-                        extracted_ok = False
-                        log.info(
-                            "7z 중첩 압축파일 %d개 추출: %s | 필요 공간 %s",
-                            len(nested_targets),
-                            task.virtual_path,
-                            format_size(nested_bytes),
-                        )
-                        try:
-                            sz.reset()
-                            sz.extract(targets=target_names, factory=factory)
-                            extracted_ok = True
-                        except py7zr.exceptions.PasswordRequired:
-                            self._add_warning(
-                                task.virtual_path,
-                                "암호화된 7z 항목이 포함되어 중첩 압축파일을 추출할 수 없습니다.",
-                            )
-                        except Exception as exc:
-                            self._add_warning(
-                                task.virtual_path,
-                                self._describe_error("7z 중첩 압축파일 추출 오류", exc),
-                                exc=exc,
-                            )
-                        finally:
-                            factory.close_all()
-
-                        if extracted_ok:
-                            for raw_name, nested_type, member_vpath in nested_targets:
-                                isolated_file = factory.outputs.get(raw_name)
-                                if isolated_file is None or not isolated_file.is_file():
-                                    self._add_warning(
-                                        member_vpath,
-                                        "7z에서 중첩 압축파일을 추출하지 못했습니다.",
-                                    )
-                                    continue
-                                if self.cancel_event.is_set():
-                                    self._safe_cleanup(isolated_file)
-                                    continue
-                                self._enqueue(
-                                    _ArchiveTask(
-                                        archive_type=nested_type,
-                                        virtual_path=member_vpath,
-                                        depth=task.depth + 1,
-                                        source_path=isolated_file,
-                                        cleanup_path=isolated_file,
-                                    )
-                                )
-                        else:
-                            for p in factory.outputs.values():
-                                self._safe_cleanup(p)
+                    elif self._temp_root is not None:
+                        self._extract_7z_nested(task, sz, nested_targets)
 
         except py7zr.exceptions.Bad7zFile:
             self._add_warning(task.virtual_path, "손상되었거나 유효하지 않은 7z 파일입니다.")
@@ -1516,23 +1738,129 @@ class ScanEngine:
 
         self._finish_archive(task, SOURCE_7Z, local_entries, note)
 
-    def _temp_space_ok(self, task: _ArchiveTask, count: int, needed: int) -> bool:
-        """Check the temp folder can hold the nested archives; warn and return False if not.
+    def _extract_7z_nested(
+        self,
+        task: _ArchiveTask,
+        sz: py7zr.SevenZipFile,
+        targets: list[tuple[str, str, str, int]],
+    ) -> None:
+        """Unpack a 7z's nested archives to temp files and queue them, within the temp budget.
 
-        Extracting anyway would fill the user's temp drive completely and then fail.
+        When they do not all fit at once they are unpacked in several passes; each pass waits
+        until the archives of earlier passes have been scanned and deleted.
         """
-        if self._temp_root is None:
-            return True
-        free = _free_bytes(self._temp_root)
-        if free is None or needed <= free:
-            return True
-        self._add_warning(
-            task.virtual_path,
-            f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
-            f"(필요 {format_size(needed)}, 여유 {format_size(free)}, "
-            f"임시 폴더: {self._temp_root.parent}). {_TEMP_DIR_HINT}",
-        )
-        return False
+        assert self._temp_root is not None
+        limit = self._temp_limit
+        capacity = None if limit is None else max(0, limit - getattr(self._tls, "held", 0))
+
+        too_big = [t for t in targets if capacity is not None and t[3] > capacity]
+        if too_big:
+            self._add_warning(
+                task.virtual_path,
+                self._temp_shortage_text(len(too_big), max(t[3] for t in too_big)),
+            )
+
+        batches: list[list[tuple[str, str, str, int]]] = []
+        batch_bytes = 0
+        for target in targets:
+            if capacity is not None and target[3] > capacity:
+                continue
+            if not batches or (capacity is not None and batch_bytes + target[3] > capacity):
+                batches.append([])
+                batch_bytes = 0
+            batches[-1].append(target)
+            batch_bytes += target[3]
+
+        for index, batch in enumerate(batches):
+            if self.cancel_event.is_set():
+                return
+            needed = sum(t[3] for t in batch)
+            remaining = sum(len(b) for b in batches[index:])
+
+            if not self._reserve_temp(needed):
+                if not self.cancel_event.is_set():
+                    self._add_warning(
+                        task.virtual_path, self._temp_shortage_text(remaining, needed)
+                    )
+                return
+
+            # The budget covers this scan only; other programs may have filled the disk
+            free = _free_bytes(self._temp_root)
+            if free is not None and needed > free:
+                self._release_temp(needed)
+                self._add_warning(
+                    task.virtual_path,
+                    f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {remaining}개의 내부를 탐색하지 "
+                    f"못했습니다 (필요 {format_size(needed)}, 여유 {format_size(free)}, "
+                    f"임시 폴더: {self._temp_root.parent}). {_TEMP_DIR_HINT}",
+                )
+                return
+
+            log.info(
+                "7z 중첩 압축파일 %d개 추출 (%d/%d회차): %s | 필요 공간 %s",
+                len(batch),
+                index + 1,
+                len(batches),
+                task.virtual_path,
+                format_size(needed),
+            )
+            factory = _Isolated7zWriterFactory(self._temp_root)
+            extracted_ok = False
+            try:
+                sz.reset()
+                sz.extract(targets=[t[0] for t in batch], factory=factory)
+                extracted_ok = True
+            except py7zr.exceptions.PasswordRequired:
+                self._add_warning(
+                    task.virtual_path,
+                    "암호화된 7z 항목이 포함되어 중첩 압축파일을 추출할 수 없습니다.",
+                )
+            except Exception as exc:
+                self._add_warning(
+                    task.virtual_path,
+                    self._describe_error("7z 중첩 압축파일 추출 오류", exc),
+                    exc=exc,
+                )
+            finally:
+                factory.close_all()
+
+            if not extracted_ok:
+                for leftover in factory.outputs.values():
+                    self._safe_cleanup(leftover)
+                self._release_temp(needed)
+                return  # the same error would repeat for the remaining passes
+
+            handed_over = 0  # budget that now belongs to the queued archives
+            for raw_name, nested_type, member_vpath, _size in batch:
+                isolated_file = factory.outputs.get(raw_name)
+                if isolated_file is None or not isolated_file.is_file():
+                    self._add_warning(
+                        member_vpath,
+                        "7z에서 중첩 압축파일을 추출하지 못했습니다.",
+                    )
+                    continue
+                if self.cancel_event.is_set():
+                    self._safe_cleanup(isolated_file)
+                    continue
+                try:
+                    file_size = isolated_file.stat().st_size
+                except OSError:
+                    file_size = _size
+                handed_over += file_size
+                self._enqueue(
+                    _ArchiveTask(
+                        archive_type=nested_type,
+                        virtual_path=member_vpath,
+                        depth=task.depth + 1,
+                        source_path=isolated_file,
+                        cleanup_path=isolated_file,
+                        temp_charge=file_size,
+                    )
+                )
+            if handed_over < needed:
+                self._release_temp(needed - handed_over)
+            elif handed_over > needed:
+                self._charge_temp(handed_over - needed)
 
     def _build_stats(
         self,
@@ -1592,4 +1920,7 @@ class ScanEngine:
                 if source in by_source
             },
             archives_without_created=self._archives_without_created,
+            temp_limit_bytes=self._temp_limit,
+            temp_peak_bytes=self._temp_peak,
+            temp_wait_count=self._temp_wait_count,
         )

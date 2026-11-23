@@ -226,6 +226,16 @@ def _write_summary_sheet(wb: Workbook, result: ScanResult) -> None:
         ("총 용량 (표시)", format_size(stats.total_size)),
         ("최대 압축 중첩 깊이", f"{stats.max_depth_seen} 단계"),
         ("사용 워커 스레드 수", f"{stats.worker_count} 개"),
+        (
+            "임시 공간 사용 한도",
+            format_size(stats.temp_limit_bytes)
+            if stats.temp_limit_bytes is not None
+            else "제한 없음",
+        ),
+        (
+            "임시 공간 최대 사용량",
+            f"{format_size(stats.temp_peak_bytes)} (공간 대기 {stats.temp_wait_count:,} 회)",
+        ),
         ("스캔 소요 시간", f"{stats.elapsed_seconds:.2f} 초"),
         ("경고 / 오류 수", f"{len(result.warnings):,} 건"),
         ("완료 상태", "사용자 중지됨" if stats.cancelled else "정상 완료"),

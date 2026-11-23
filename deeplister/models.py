@@ -84,6 +84,8 @@ class ScanOptions:
     max_total_memory_bytes: int = 128 * 1024 * 1024  # 128 MB global queued memory cap
     # Folder in which nested archives are unpacked; None = the system temp folder
     temp_dir: str | None = None
+    # Most temp disk space the scan may use at once; None = most of the folder's free space
+    max_temp_bytes: int | None = None
 
 
 @dataclass
@@ -109,6 +111,11 @@ class ScanStats:
     created_by_source: dict[str, tuple[int, int]] = field(default_factory=dict)  # (present, total)
     archives_without_created: int = 0
     log_path: str = ""
+    # Temp disk budget: the limit in effect (None = unlimited), peak use, and how often a
+    # worker had to wait for space
+    temp_limit_bytes: int | None = None
+    temp_peak_bytes: int = 0
+    temp_wait_count: int = 0
 
 
 @dataclass
