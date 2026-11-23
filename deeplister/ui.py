@@ -702,6 +702,8 @@ class MainWindow(QMainWindow):
         self.table_view = QTableView()
         self.table_view.setModel(self.proxy_model)
         self.table_view.setSortingEnabled(True)
+        # Qt's default sort indicator is column 0 descending, which listed results last-to-first
+        self.table_view.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)

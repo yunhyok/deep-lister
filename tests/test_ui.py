@@ -45,6 +45,10 @@ def test_gui_scan_and_filter(tmp_path: Path) -> None:
     assert win.table_model.rowCount() == 2  # bundle.zip + summary.txt
     assert win.btn_export.isEnabled()
 
+    # Rows are listed first-to-last by default, matching the exported workbook
+    assert win.proxy_model.data(win.proxy_model.index(0, 0)) == "1"
+    assert win.proxy_model.data(win.proxy_model.index(1, 0)) == "2"
+
     # Size is shown once, in bytes: the duplicate human-readable column is gone
     model = win.table_model
     assert model.columnCount() == 7
