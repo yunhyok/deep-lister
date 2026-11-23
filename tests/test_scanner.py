@@ -398,6 +398,7 @@ def test_nested_7z_extraction_is_skipped_when_temp_space_is_insufficient(
     assert len(result.warnings) == 1
     assert "임시 폴더 여유 공간이 부족" in result.warnings[0].reason
     assert "중첩 압축파일 1개" in result.warnings[0].reason
+    assert "옵션의 '임시 폴더'" in result.warnings[0].reason  # tells the user how to fix it
 
 
 def test_disk_full_during_nested_extraction_reports_temp_folder(
@@ -419,3 +420,55 @@ def test_disk_full_during_nested_extraction_reports_temp_folder(
     assert "7z 중첩 압축파일 추출 오류" in reason
     assert "No space left on device" in reason
     assert "임시 폴더(" in reason and "여유 공간" in reason
+    assert "옵션의 '임시 폴더'" in reason
+
+
+def test_custom_temp_dir_holds_nested_archives_and_is_cleaned_up(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    extracted_to: list[Path] = []
+    original_create = scanner_module._Isolated7zWriterFactory.create
+
+    def _recording_create(self, filename):
+        writer = original_create(self, filename)
+        extracted_to.append(writer.path)
+        return writer
+
+    monkeypatch.setattr(scanner_module._Isolated7zWriterFactory, "create", _recording_create)
+
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(work_dir))).scan([archive])
+
+    assert not result.warnings
+    assert "deep.txt" in {e.name for e in result.entries}  # nested archive was scanned
+    assert len(extracted_to) == 1
+    assert work_dir in extracted_to[0].parents  # ...and unpacked inside the chosen folder
+    assert list(work_dir.iterdir()) == []  # nothing is left behind
+
+
+def test_unusable_temp_dir_falls_back_to_system_temp(tmp_path: Path) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+    missing = tmp_path / "no_such_folder"
+
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(missing))).scan([archive])
+
+    assert "deep.txt" in {e.name for e in result.entries}  # the scan still completes
+    assert len(result.warnings) == 1
+    assert result.warnings[0].path == str(missing)
+    assert "지정한 임시 폴더를 사용할 수 없어" in result.warnings[0].reason
+    assert not missing.exists()
+
+
+def test_temp_dir_problem(tmp_path: Path) -> None:
+    a_file = tmp_path / "file.txt"
+    a_file.write_bytes(b"x")
+
+    assert scanner_module.temp_dir_problem(tmp_path) is None
+    assert scanner_module.temp_dir_problem(tmp_path / "missing") is not None
+    assert scanner_module.temp_dir_problem(a_file) is not None
+    assert list(tmp_path.iterdir()) == [a_file]  # the probe file is removed

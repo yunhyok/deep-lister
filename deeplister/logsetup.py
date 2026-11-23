@@ -31,12 +31,16 @@ _log_path: Path | None = None
 _hooks_installed = False
 
 
-def default_log_dir() -> Path:
-    """Per-user log folder (%LOCALAPPDATA%\\DeepLister\\logs on Windows)."""
+def app_data_dir() -> Path:
+    """Per-user folder for logs and settings (%LOCALAPPDATA%\\DeepLister on Windows)."""
     base = os.environ.get("LOCALAPPDATA")
     if base:
-        return Path(base) / APP_NAME / "logs"
-    return Path.home() / f".{APP_NAME.lower()}" / "logs"
+        return Path(base) / APP_NAME
+    return Path.home() / f".{APP_NAME.lower()}"
+
+
+def default_log_dir() -> Path:
+    return app_data_dir() / "logs"
 
 
 def free_space_text(path: str | Path) -> str:

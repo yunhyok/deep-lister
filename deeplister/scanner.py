@@ -246,6 +246,23 @@ def _free_bytes(path: Path) -> int | None:
         return None
 
 
+def temp_dir_problem(path: str | Path) -> str | None:
+    """Return why a folder cannot serve as the temp work folder, or None when it can."""
+    folder = Path(path)
+    try:
+        if not folder.is_dir():
+            return "폴더가 없습니다."
+        with tempfile.TemporaryFile(dir=folder):
+            pass
+    except OSError as exc:
+        return f"폴더에 쓸 수 없습니다: {exc}"
+    return None
+
+
+# Appended to disk-space warnings: the fix is in the user's hands
+_TEMP_DIR_HINT = "옵션의 '임시 폴더'를 여유 공간이 큰 드라이브로 바꾼 뒤 다시 스캔하세요."
+
+
 def _normalize_member_relpath(member_name: str) -> str:
     return member_name.replace("\\", "/").strip("/")
 
@@ -436,7 +453,19 @@ class ScanEngine:
         for p in unique_paths:
             log.info("대상: %s", p)
 
-        with tempfile.TemporaryDirectory(prefix="deeplister_") as temp_dir:
+        temp_parent: str | None = None
+        if self.options.temp_dir:
+            problem = temp_dir_problem(self.options.temp_dir)
+            if problem is None:
+                temp_parent = str(self.options.temp_dir)
+            else:
+                self._add_warning(
+                    str(self.options.temp_dir),
+                    f"지정한 임시 폴더를 사용할 수 없어 시스템 임시 폴더({tempfile.gettempdir()})를 "
+                    f"대신 사용했습니다: {problem}",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="deeplister_", dir=temp_parent) as temp_dir:
             self._temp_root = Path(temp_dir)
             free = _free_bytes(self._temp_root)
             log.info(
@@ -589,7 +618,7 @@ class ScanEngine:
         if isinstance(exc, OSError) and exc.errno == errno.ENOSPC and self._temp_root is not None:
             free = _free_bytes(self._temp_root)
             free_text = format_size(free) if free is not None else "알 수 없음"
-            text += f" — 임시 폴더({self._temp_root.parent}) 여유 공간 {free_text}"
+            text += f" — 임시 폴더({self._temp_root.parent}) 여유 공간 {free_text}. {_TEMP_DIR_HINT}"
         return text
 
     def _finish_archive(
@@ -1501,7 +1530,7 @@ class ScanEngine:
             task.virtual_path,
             f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
             f"(필요 {format_size(needed)}, 여유 {format_size(free)}, "
-            f"임시 폴더: {self._temp_root.parent})",
+            f"임시 폴더: {self._temp_root.parent}). {_TEMP_DIR_HINT}",
         )
         return False
 
