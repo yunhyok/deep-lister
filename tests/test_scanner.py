@@ -2,20 +2,96 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 import struct
 import tarfile
 import threading
 import zipfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 import py7zr
-import pytest
 
-from deeplister.models import EntryKind, ScanOptions
+from deeplister import scanner as scanner_module
+from deeplister.models import (
+    SOURCE_7Z,
+    SOURCE_FILESYSTEM,
+    SOURCE_ZIP,
+    EntryKind,
+    ScanOptions,
+)
 from deeplister.scanner import ScanEngine, detect_archive_type
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def _to_local_naive(utc_dt: datetime) -> datetime:
+    """Mirror the scanner's convention: timestamps are reported as naive local time."""
+    return utc_dt.astimezone().replace(tzinfo=None)
+
+
+def _build_zip_with_ut_field(
+    name: str, data: bytes, mtime: int, atime: int, ctime: int
+) -> bytes:
+    """Hand-build a ZIP whose "UT" extra field follows the Info-ZIP layout exactly.
+
+    The local header carries modification, access and creation time; the central directory
+    copy keeps the same flag byte but only the modification time.
+    """
+    raw_name = name.encode("ascii")
+    crc = zlib.crc32(data)
+    local_extra = struct.pack("<HHBiii", 0x5455, 13, 0x07, mtime, atime, ctime)
+    central_extra = struct.pack("<HHBi", 0x5455, 5, 0x07, mtime)
+    dos_time, dos_date = 0, (2020 - 1980) << 9 | 1 << 5 | 1
+
+    local = (
+        struct.pack(
+            "<4s5H3L2H",
+            b"PK\x03\x04",
+            20,
+            0,
+            0,
+            dos_time,
+            dos_date,
+            crc,
+            len(data),
+            len(data),
+            len(raw_name),
+            len(local_extra),
+        )
+        + raw_name
+        + local_extra
+        + data
+    )
+    central = (
+        struct.pack(
+            "<4s6H3L5H2L",
+            b"PK\x01\x02",
+            20,
+            20,
+            0,
+            0,
+            dos_time,
+            dos_date,
+            crc,
+            len(data),
+            len(data),
+            len(raw_name),
+            len(central_extra),
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        + raw_name
+        + central_extra
+    )
+    end = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, len(central), len(local), 0)
+    return local + central + end
 
 
 def _make_ntfs_extra(mtime_dt: datetime, ctime_dt: datetime) -> bytes:
@@ -223,3 +299,123 @@ def test_multithreaded_large_fanout_and_cancel(tmp_path: Path) -> None:
     cancelled_result = ScanEngine(ScanOptions(max_workers=4), cancel_event=cancel).scan([tmp_path])
     assert cancelled_result.stats.cancelled is True
     assert cancelled_result.stats.total_entries == 0
+
+
+def test_7z_creation_time_is_extracted_when_the_archive_stores_it() -> None:
+    """7-Zip only writes creation time with -mtc=on; the scanner must surface it when present."""
+    result = ScanEngine(ScanOptions(max_workers=2)).scan([DATA_DIR / "7zip_mtc_on.7z"])
+    members = {e.name: e for e in result.entries if e.archive_depth == 1}
+
+    assert set(members) == {"report.txt", "note.txt"}
+    stored_created = datetime(2026, 11, 23, 0, 30, 37, tzinfo=timezone.utc)
+    stored_modified = datetime(2024, 7, 30, 9, 26, 21, tzinfo=timezone.utc)
+    for entry in members.values():
+        assert entry.source == SOURCE_7Z
+        assert entry.created_at is not None
+        assert entry.created_at.replace(microsecond=0) == _to_local_naive(stored_created)
+        assert entry.modified_at == _to_local_naive(stored_modified)
+
+    assert result.stats.created_by_source[SOURCE_7Z] == (2, 2)
+    assert result.stats.archives_without_created == 0
+
+
+def test_7z_made_with_default_settings_has_no_creation_time() -> None:
+    """A default 7-Zip archive stores no creation time: report it as missing, never guess."""
+    result = ScanEngine(ScanOptions(max_workers=2)).scan(
+        [DATA_DIR / "7zip_default_no_ctime.7z"]
+    )
+    members = [e for e in result.entries if e.archive_depth == 1]
+
+    assert len(members) == 2
+    assert all(e.created_at is None for e in members)
+    assert all(e.modified_at is not None for e in members)
+    assert not result.warnings
+
+    stats = result.stats
+    assert stats.created_by_source[SOURCE_7Z] == (0, 2)
+    assert stats.archives_without_created == 1
+    assert stats.created_missing >= 2  # + the .7z file itself where the OS has no birth time
+    assert stats.created_present + stats.created_missing == stats.total_entries
+
+
+def test_zip_ut_creation_time_is_read_from_local_header(tmp_path: Path) -> None:
+    """Info-ZIP keeps the creation time only in the local header's UT field."""
+    mtime = int(datetime(2021, 3, 4, 5, 6, 7, tzinfo=timezone.utc).timestamp())
+    atime = int(datetime(2022, 1, 1, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    ctime = int(datetime(2019, 2, 22, 16, 20, 42, tzinfo=timezone.utc).timestamp())
+    zip_path = tmp_path / "infozip_style.zip"
+    zip_path.write_bytes(_build_zip_with_ut_field("doc.txt", b"payload", mtime, atime, ctime))
+
+    with zipfile.ZipFile(zip_path) as zf:  # sanity: a valid archive for the standard library
+        assert zf.testzip() is None
+        assert len(zf.infolist()[0].extra) == 9  # central copy: flags + modification time only
+
+    result = ScanEngine(ScanOptions(max_workers=2)).scan([zip_path])
+    members = [e for e in result.entries if e.archive_depth == 1]
+    assert len(members) == 1
+    entry = members[0]
+    assert entry.source == SOURCE_ZIP
+    assert entry.created_at == _to_local_naive(datetime.fromtimestamp(ctime, tz=timezone.utc))
+    assert entry.modified_at == _to_local_naive(datetime.fromtimestamp(mtime, tz=timezone.utc))
+
+
+def test_created_date_statistics_per_source(tmp_path: Path) -> None:
+    (tmp_path / "plain.txt").write_bytes(b"x")
+    with zipfile.ZipFile(tmp_path / "plain.zip", "w") as zf:
+        zf.writestr("inside.txt", b"abc")  # zipfile writes no timestamp extra fields
+
+    result = ScanEngine(ScanOptions(max_workers=2)).scan([tmp_path])
+    stats = result.stats
+
+    assert stats.created_by_source[SOURCE_ZIP] == (0, 1)
+    assert stats.created_by_source[SOURCE_FILESYSTEM][1] == 2  # plain.txt + plain.zip
+    assert stats.archives_without_created == 1
+    assert stats.created_present + stats.created_missing == stats.total_entries
+    assert sum(total for _present, total in stats.created_by_source.values()) == stats.total_entries
+
+
+def _make_7z_with_nested_zip(path: Path) -> None:
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("deep.txt", b"deep")
+    with py7zr.SevenZipFile(path, "w") as sz:
+        sz.writestr(inner.getvalue(), "nested/inner.zip")
+        sz.writestr(b"top", "top.txt")
+
+
+def test_nested_7z_extraction_is_skipped_when_temp_space_is_insufficient(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+    monkeypatch.setattr(scanner_module, "_free_bytes", lambda _path: 0)
+
+    result = ScanEngine(ScanOptions(max_workers=2)).scan([archive])
+    names = {e.name for e in result.entries}
+
+    assert {"outer.7z", "inner.zip", "top.txt"} <= names
+    assert "deep.txt" not in names
+    assert len(result.warnings) == 1
+    assert "임시 폴더 여유 공간이 부족" in result.warnings[0].reason
+    assert "중첩 압축파일 1개" in result.warnings[0].reason
+
+
+def test_disk_full_during_nested_extraction_reports_temp_folder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+
+    def _disk_full(self, filename):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(scanner_module._Isolated7zWriterFactory, "create", _disk_full)
+
+    result = ScanEngine(ScanOptions(max_workers=2)).scan([archive])
+
+    assert "deep.txt" not in {e.name for e in result.entries}
+    assert len(result.warnings) == 1
+    reason = result.warnings[0].reason
+    assert "7z 중첩 압축파일 추출 오류" in reason
+    assert "No space left on device" in reason
+    assert "임시 폴더(" in reason and "여유 공간" in reason

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import io
+import logging
 import os
 import queue
 import shutil
@@ -22,13 +24,21 @@ import py7zr
 import py7zr.io
 
 from .models import (
+    SOURCE_7Z,
+    SOURCE_FILESYSTEM,
+    SOURCE_LABELS,
+    SOURCE_TAR,
+    SOURCE_ZIP,
     EntryKind,
     FileEntry,
     ScanOptions,
     ScanResult,
     ScanStats,
     ScanWarning,
+    format_size,
 )
+
+log = logging.getLogger("deeplister.scanner")
 
 # Archive extensions (multi-part suffixes checked first)
 TAR_MULTI_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz")
@@ -132,20 +142,20 @@ def _decode_zip_filename(info: zipfile.ZipInfo) -> str:
     return info.filename
 
 
-def _parse_zip_timestamps(info: zipfile.ZipInfo) -> tuple[datetime | None, datetime | None]:
-    """Extract (created_at, modified_at) from ZipInfo DOS header and extra fields."""
-    created_at: datetime | None = None
-    modified_at: datetime | None = None
-    has_ntfs_mod = False
+# Which timestamp extra fields a ZIP member carries (bit flags from _parse_zip_extra)
+_ZIP_HAS_NTFS = 0x1
+_ZIP_HAS_UT = 0x2
+_ZIP_UT_CTIME_IN_LOCAL = 0x4
 
-    try:
-        y, mo, d, h, mi, s = info.date_time
-        if y >= 1980:
-            modified_at = datetime(y, mo, d, h, mi, min(s, 59))
-    except ValueError:
-        modified_at = None
 
-    extra = info.extra or b""
+def _parse_zip_extra(extra: bytes) -> tuple[datetime | None, datetime | None, int]:
+    """Parse ZIP extra-field bytes into (created_at, modified_at, field_flags)."""
+    ntfs_cre: datetime | None = None
+    ntfs_mod: datetime | None = None
+    ut_cre: datetime | None = None
+    ut_mod: datetime | None = None
+    seen = 0
+
     pos = 0
     end = len(extra)
     while pos + 4 <= end:
@@ -158,6 +168,7 @@ def _parse_zip_timestamps(info: zipfile.ZipInfo) -> tuple[datetime | None, datet
 
         # 0x000A: NTFS Extra Field (100-ns Windows FILETIME mtime, atime, ctime)
         if header_id == 0x000A and data_size >= 8:
+            seen |= _ZIP_HAS_NTFS
             sub_pos = 4  # skip 4 reserved bytes
             while sub_pos + 4 <= data_size:
                 tag, tag_size = struct.unpack_from("<HH", chunk, sub_pos)
@@ -166,34 +177,73 @@ def _parse_zip_timestamps(info: zipfile.ZipInfo) -> tuple[datetime | None, datet
                     break
                 if tag == 0x0001 and tag_size == 24:
                     mtime_ft, _atime_ft, ctime_ft = struct.unpack_from("<QQQ", chunk, sub_pos)
-                    ntfs_mod = _filetime_to_local(mtime_ft)
-                    ntfs_cre = _filetime_to_local(ctime_ft)
-                    if ntfs_mod is not None:
-                        modified_at = ntfs_mod
-                        has_ntfs_mod = True
-                    if ntfs_cre is not None:
-                        created_at = ntfs_cre
+                    ntfs_mod = _filetime_to_local(mtime_ft) or ntfs_mod
+                    ntfs_cre = _filetime_to_local(ctime_ft) or ntfs_cre
                 sub_pos += tag_size
 
-        # 0x5455: Extended Timestamp (UT, signed 32-bit Unix seconds)
+        # 0x5455: Extended Timestamp (UT, signed 32-bit Unix seconds). The flag bits always
+        # describe the LOCAL header; the central-directory copy holds the modification time only.
         elif header_id == 0x5455 and data_size >= 1:
+            seen |= _ZIP_HAS_UT
             flags = chunk[0]
             offset = 1
             if (flags & 0x01) and offset + 4 <= data_size:
-                if not has_ntfs_mod:
-                    ut_mod = _utc_ts_to_local(struct.unpack_from("<i", chunk, offset)[0])
-                    if ut_mod is not None:
-                        modified_at = ut_mod
+                ut_mod = _utc_ts_to_local(struct.unpack_from("<i", chunk, offset)[0])
                 offset += 4
             if (flags & 0x02) and offset + 4 <= data_size:
                 offset += 4  # atime
-            if (flags & 0x04) and offset + 4 <= data_size:
-                if created_at is None:
+            if flags & 0x04:
+                if offset + 4 <= data_size:
                     ut_cre = _utc_ts_to_local(struct.unpack_from("<i", chunk, offset)[0])
-                    if ut_cre is not None:
-                        created_at = ut_cre
+                else:
+                    seen |= _ZIP_UT_CTIME_IN_LOCAL
 
-    return created_at, modified_at
+    return ntfs_cre or ut_cre, ntfs_mod or ut_mod, seen
+
+
+def _zip_dos_datetime(info: zipfile.ZipInfo) -> datetime | None:
+    """Modification time from the mandatory DOS date/time header (creator's local time)."""
+    try:
+        y, mo, d, h, mi, sec = info.date_time
+        if y >= 1980:
+            return datetime(y, mo, d, h, mi, min(sec, 59))
+    except ValueError:
+        pass
+    return None
+
+
+def _read_zip_local_extra(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Read a member's local-header extra field (zipfile only exposes the central copy)."""
+    fp = zf.fp
+    if fp is None:
+        return b""
+    try:
+        fp.seek(info.header_offset)
+        header = fp.read(30)
+        if len(header) != 30 or header[:4] != b"PK\x03\x04":
+            return b""
+        name_len, extra_len = struct.unpack_from("<HH", header, 26)
+        fp.seek(name_len, os.SEEK_CUR)
+        return fp.read(extra_len)
+    except (OSError, ValueError):
+        return b""
+
+
+def _zip_member_timestamps(
+    zf: zipfile.ZipFile, info: zipfile.ZipInfo
+) -> tuple[datetime | None, datetime | None, int]:
+    """Return (created_at, modified_at, field_flags) for a ZIP member."""
+    created, modified, seen = _parse_zip_extra(info.extra or b"")
+    if created is None and seen & _ZIP_UT_CTIME_IN_LOCAL:
+        created = _parse_zip_extra(_read_zip_local_extra(zf, info))[0]
+    return created, modified or _zip_dos_datetime(info), seen
+
+
+def _free_bytes(path: Path) -> int | None:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
 
 
 def _normalize_member_relpath(member_name: str) -> str:
@@ -310,6 +360,7 @@ class _ArchiveTask:
     source_bytes: bytes | None = None
     memory_charge: int = 0
     cleanup_path: Path | None = None
+    started: float = 0.0
 
 
 class ScanEngine:
@@ -335,6 +386,7 @@ class ScanEngine:
         self._entries: list[FileEntry] = []
         self._warnings: list[ScanWarning] = []
         self._archives_scanned = 0
+        self._archives_without_created = 0
         self._total_size = 0
         self._max_depth_seen = 0
         self._current_path = ""
@@ -349,6 +401,7 @@ class ScanEngine:
         self._entries.clear()
         self._warnings.clear()
         self._archives_scanned = 0
+        self._archives_without_created = 0
         self._total_size = 0
         self._max_depth_seen = 0
         self._current_path = ""
@@ -379,8 +432,18 @@ class ScanEngine:
 
         worker_count = max(1, min(32, int(self.options.max_workers)))
 
+        log.info("----- 스캔 시작: 대상 %d개 | %s", len(unique_paths), self.options)
+        for p in unique_paths:
+            log.info("대상: %s", p)
+
         with tempfile.TemporaryDirectory(prefix="deeplister_") as temp_dir:
             self._temp_root = Path(temp_dir)
+            free = _free_bytes(self._temp_root)
+            log.info(
+                "임시 작업 폴더: %s (여유 공간 %s)",
+                temp_dir,
+                format_size(free) if free is not None else "알 수 없음",
+            )
 
             for p in unique_paths:
                 if self.cancel_event.is_set():
@@ -401,7 +464,7 @@ class ScanEngine:
                 threads = [
                     threading.Thread(
                         target=self._worker_loop,
-                        name=f"DeepLister-Worker-{i + 1}",
+                        name=f"Worker-{i + 1}",
                         daemon=True,
                     )
                     for i in range(worker_count)
@@ -425,6 +488,7 @@ class ScanEngine:
             worker_count=worker_count,
         )
         self._emit_progress(force=True)
+        self._log_summary(stats)
         return ScanResult(entries=list(self._entries), warnings=list(self._warnings), stats=stats)
 
     def _try_reserve_memory(self, nbytes: int) -> bool:
@@ -477,7 +541,7 @@ class ScanEngine:
                         self._scan_archive(task)
             except Exception as exc:
                 target = str(task.path) if isinstance(task, _DirTask) else task.virtual_path
-                self._add_warning(target, f"처리 중 오류: {exc}")
+                self._add_warning(target, self._describe_error("처리 중 오류", exc), exc=exc)
             finally:
                 if isinstance(task, _ArchiveTask):
                     self._release_memory(task.memory_charge)
@@ -509,11 +573,93 @@ class ScanEngine:
                 self._current_path = current_path
         self._emit_progress()
 
-    def _add_warning(self, path: str, reason: str) -> None:
+    def _add_warning(self, path: str, reason: str, exc: BaseException | None = None) -> None:
         with self._result_lock:
             self._warnings.append(ScanWarning(path=path, reason=reason))
             self._current_path = path
+        if exc is not None:
+            log.warning("%s | %s", path, reason, exc_info=(type(exc), exc, exc.__traceback__))
+        else:
+            log.warning("%s | %s", path, reason)
         self._emit_progress()
+
+    def _describe_error(self, prefix: str, exc: BaseException) -> str:
+        """Warning text for an exception; adds temp-folder context when the disk is full."""
+        text = f"{prefix}: {exc}"
+        if isinstance(exc, OSError) and exc.errno == errno.ENOSPC and self._temp_root is not None:
+            free = _free_bytes(self._temp_root)
+            free_text = format_size(free) if free is not None else "알 수 없음"
+            text += f" — 임시 폴더({self._temp_root.parent}) 여유 공간 {free_text}"
+        return text
+
+    def _finish_archive(
+        self,
+        task: _ArchiveTask,
+        source: str,
+        entries: list[FileEntry],
+        note: str = "",
+    ) -> None:
+        """Tag an archive's entries with their source, log its timestamp coverage, publish them."""
+        files = created = modified = 0
+        for e in entries:
+            e.source = source
+            if e.kind == EntryKind.DIRECTORY:
+                continue
+            files += 1
+            if e.created_at is not None:
+                created += 1
+            if e.modified_at is not None:
+                modified += 1
+
+        if files and not created:
+            with self._result_lock:
+                self._archives_without_created += 1
+
+        if log.isEnabledFor(logging.INFO):
+            if task.cleanup_path is not None:
+                origin = "임시 파일"
+            elif task.source_bytes is not None:
+                origin = "메모리"
+            else:
+                origin = "디스크"
+            log.info(
+                "%s 스캔 완료: %s | 깊이 %d | 원본 %s | 파일 %d개 | 생성 시각 %d/%d | "
+                "수정 시각 %d/%d | %.2f초%s",
+                "7z" if source == SOURCE_7Z else source.upper(),
+                task.virtual_path,
+                task.depth,
+                origin,
+                files,
+                created,
+                files,
+                modified,
+                files,
+                time.perf_counter() - task.started,
+                f" | {note}" if note else "",
+            )
+
+        self._add_entries(entries, current_path=task.virtual_path)
+
+    def _log_summary(self, stats: ScanStats) -> None:
+        if not log.isEnabledFor(logging.INFO):
+            return
+        log.info(
+            "----- 스캔 %s: 항목 %d개 | 탐색 압축파일 %d개 | 총 용량 %s | 경고 %d건 | %.2f초",
+            "중지됨" if stats.cancelled else "완료",
+            stats.total_entries,
+            stats.archives_scanned,
+            format_size(stats.total_size),
+            stats.warnings_count,
+            stats.elapsed_seconds,
+        )
+        log.info(
+            "생성 날짜: 기록됨 %d개 / 없음 %d개 | 생성 시각이 저장되지 않은 압축파일 %d개",
+            stats.created_present,
+            stats.created_missing,
+            stats.archives_without_created,
+        )
+        for source, (present, total) in stats.created_by_source.items():
+            log.info("  %s: 생성 날짜 %d / %d", SOURCE_LABELS.get(source, source), present, total)
 
     def _emit_progress(self, force: bool = False) -> None:
         if self.progress_callback is None:
@@ -542,7 +688,7 @@ class ScanEngine:
         try:
             st = path.stat()
         except OSError as exc:
-            self._add_warning(str(path), f"파일 정보를 읽을 수 없습니다: {exc}")
+            self._add_warning(str(path), f"파일 정보를 읽을 수 없습니다: {exc}", exc=exc)
             return
 
         created, modified = _stat_timestamps(st)
@@ -660,9 +806,9 @@ class ScanEngine:
                                         "RAR 형식은 내장 엔진에서 지원되지 않아 압축 파일 자체만 기록했습니다.",
                                     )
                     except OSError as exc:
-                        self._add_warning(de.path, f"항목 접근 실패: {exc}")
+                        self._add_warning(de.path, f"항목 접근 실패: {exc}", exc=exc)
         except OSError as exc:
-            self._add_warning(str(dir_path), f"폴더 열기 실패: {exc}")
+            self._add_warning(str(dir_path), f"폴더 열기 실패: {exc}", exc=exc)
             return
 
         if not has_children and self.options.include_empty_dirs:
@@ -696,6 +842,7 @@ class ScanEngine:
         with self._result_lock:
             self._archives_scanned += 1
             self._current_path = task.virtual_path
+        task.started = time.perf_counter()
 
         if task.archive_type == "zip":
             self._scan_zip(task)
@@ -843,6 +990,7 @@ class ScanEngine:
         local_entries: list[FileEntry] = []
         candidate_dirs: dict[str, FileEntry] = {}
         non_empty_dirs: set[str] = set()
+        ntfs_fields = ut_fields = no_time_fields = 0
 
         try:
             with zipfile.ZipFile(source, "r") as zf:
@@ -863,7 +1011,7 @@ class ScanEngine:
                                 task.virtual_path, decoded_name
                             )
                             if name:
-                                created, modified = _parse_zip_timestamps(info)
+                                created, modified, _seen = _zip_member_timestamps(zf, info)
                                 candidate_dirs[relpath] = FileEntry(
                                     directory=directory,
                                     name=name,
@@ -880,7 +1028,13 @@ class ScanEngine:
                     )
                     if not name:
                         continue
-                    created, modified = _parse_zip_timestamps(info)
+                    created, modified, seen = _zip_member_timestamps(zf, info)
+                    if seen & _ZIP_HAS_NTFS:
+                        ntfs_fields += 1
+                    if seen & _ZIP_HAS_UT:
+                        ut_fields += 1
+                    if not seen & (_ZIP_HAS_NTFS | _ZIP_HAS_UT):
+                        no_time_fields += 1
                     nested_type = detect_archive_type(name)
                     is_nested_supported = nested_type in ("zip", "7z", "tar")
                     member_vpath = f"{directory}{os.sep}{name}"
@@ -917,11 +1071,13 @@ class ScanEngine:
                                 self._add_warning(
                                     member_vpath,
                                     f"중첩 압축파일 추출 실패(암호화 등): {exc}",
+                                    exc=exc,
                                 )
                             except Exception as exc:
                                 self._add_warning(
                                     member_vpath,
-                                    f"중첩 압축파일 읽기 실패: {exc}",
+                                    self._describe_error("중첩 압축파일 읽기 실패", exc),
+                                    exc=exc,
                                 )
                     else:
                         local_entries.append(
@@ -944,7 +1100,7 @@ class ScanEngine:
             self._add_warning(task.virtual_path, "손상되었거나 유효하지 않은 ZIP 파일입니다.")
             return
         except Exception as exc:
-            self._add_warning(task.virtual_path, f"ZIP 열기 오류: {exc}")
+            self._add_warning(task.virtual_path, f"ZIP 열기 오류: {exc}", exc=exc)
             return
 
         if candidate_dirs:
@@ -952,7 +1108,11 @@ class ScanEngine:
                 if rel not in non_empty_dirs:
                     local_entries.append(entry)
 
-        self._add_entries(local_entries, current_path=task.virtual_path)
+        note = (
+            f"시각 확장 필드: NTFS(0x000A) {ntfs_fields}개, UT(0x5455) {ut_fields}개, "
+            f"없음 {no_time_fields}개"
+        )
+        self._finish_archive(task, SOURCE_ZIP, local_entries, note)
 
     def _scan_tar(self, task: _ArchiveTask) -> None:
         local_entries: list[FileEntry] = []
@@ -1045,7 +1205,8 @@ class ScanEngine:
                         except Exception as exc:
                             self._add_warning(
                                 member_vpath,
-                                f"TAR 내부 중첩 압축파일 읽기 실패: {exc}",
+                                self._describe_error("TAR 내부 중첩 압축파일 읽기 실패", exc),
+                                exc=exc,
                             )
                     else:
                         local_entries.append(
@@ -1065,7 +1226,7 @@ class ScanEngine:
                                 "중첩 RAR 형식은 내장 엔진에서 지원되지 않아 파일 자체만 기록했습니다.",
                             )
         except (tarfile.TarError, EOFError, OSError) as exc:
-            self._add_warning(task.virtual_path, f"TAR 압축파일 읽기 오류: {exc}")
+            self._add_warning(task.virtual_path, f"TAR 압축파일 읽기 오류: {exc}", exc=exc)
             return
 
         if candidate_dirs:
@@ -1073,7 +1234,8 @@ class ScanEngine:
                 if rel not in non_empty_dirs:
                     local_entries.append(entry)
 
-        self._add_entries(local_entries, current_path=task.virtual_path)
+        note = "TAR은 생성 시각을 저장하지 않음(pax 확장 헤더가 있을 때만 기록)"
+        self._finish_archive(task, SOURCE_TAR, local_entries, note)
 
     def _scan_7z(self, task: _ArchiveTask) -> None:
         source = (
@@ -1088,6 +1250,9 @@ class ScanEngine:
         candidate_dirs: dict[str, FileEntry] = {}
         non_empty_dirs: set[str] = set()
         nested_targets: list[tuple[str, str, str]] = []  # (raw_member_name, nested_type, member_vpath)
+        nested_bytes = 0  # uncompressed size the nested archives need in the temp folder
+        has_ctime_property = False  # 7z header carries the optional creation-time property
+        note = ""
 
         try:
             with py7zr.SevenZipFile(source, mode="r") as sz:
@@ -1124,6 +1289,8 @@ class ScanEngine:
                                 props = af.file_properties() or {}
                             except Exception:
                                 props = {}
+                        if "creationtime" in props:
+                            has_ctime_property = True
                         raw_cre = props.get("creationtime", getattr(af, "creationtime", None))
                         raw_mod = props.get("lastwritetime", getattr(af, "lastwritetime", None))
                         created = _any_7z_time_to_local(raw_cre)
@@ -1170,6 +1337,7 @@ class ScanEngine:
                                     )
                                 )
                             nested_targets.append((raw_name, nested_type, member_vpath))
+                            nested_bytes += size
                         else:
                             local_entries.append(
                                 FileEntry(
@@ -1187,7 +1355,13 @@ class ScanEngine:
                                     member_vpath,
                                     "중첩 RAR 형식은 내장 엔진에서 지원되지 않아 파일 자체만 기록했습니다.",
                                 )
+                    if not has_ctime_property:
+                        note = (
+                            "7z 헤더에 생성 시각(kCTime) 속성 없음 — "
+                            "압축 시 생성 시각 저장 옵션(-mtc=on)을 쓰지 않은 압축파일"
+                        )
                 else:
+                    note = "py7zr list() 호환 경로: 생성 시각을 읽을 수 없음"
                     for fi in sz.list():
                         if self.cancel_event.is_set():
                             return
@@ -1215,6 +1389,7 @@ class ScanEngine:
                                     )
                                 )
                             nested_targets.append((fi.filename, nested_type, member_vpath))
+                            nested_bytes += int(fi.uncompressed or 0)
                         else:
                             local_entries.append(
                                 FileEntry(
@@ -1237,10 +1412,18 @@ class ScanEngine:
                                 member_vpath,
                                 f"최대 압축 중첩 깊이({self.options.max_archive_depth})를 초과하여 탐색을 중단했습니다.",
                             )
-                    elif self._temp_root is not None:
+                    elif self._temp_root is not None and self._temp_space_ok(
+                        task, len(nested_targets), nested_bytes
+                    ):
                         factory = _Isolated7zWriterFactory(self._temp_root)
                         target_names = [t[0] for t in nested_targets]
                         extracted_ok = False
+                        log.info(
+                            "7z 중첩 압축파일 %d개 추출: %s | 필요 공간 %s",
+                            len(nested_targets),
+                            task.virtual_path,
+                            format_size(nested_bytes),
+                        )
                         try:
                             sz.reset()
                             sz.extract(targets=target_names, factory=factory)
@@ -1253,7 +1436,8 @@ class ScanEngine:
                         except Exception as exc:
                             self._add_warning(
                                 task.virtual_path,
-                                f"7z 중첩 압축파일 추출 오류: {exc}",
+                                self._describe_error("7z 중첩 압축파일 추출 오류", exc),
+                                exc=exc,
                             )
                         finally:
                             factory.close_all()
@@ -1293,7 +1477,7 @@ class ScanEngine:
             )
             return
         except Exception as exc:
-            self._add_warning(task.virtual_path, f"7z 열기 오류: {exc}")
+            self._add_warning(task.virtual_path, f"7z 열기 오류: {exc}", exc=exc)
             return
 
         if candidate_dirs:
@@ -1301,7 +1485,25 @@ class ScanEngine:
                 if rel not in non_empty_dirs:
                     local_entries.append(entry)
 
-        self._add_entries(local_entries, current_path=task.virtual_path)
+        self._finish_archive(task, SOURCE_7Z, local_entries, note)
+
+    def _temp_space_ok(self, task: _ArchiveTask, count: int, needed: int) -> bool:
+        """Check the temp folder can hold the nested archives; warn and return False if not.
+
+        Extracting anyway would fill the user's temp drive completely and then fail.
+        """
+        if self._temp_root is None:
+            return True
+        free = _free_bytes(self._temp_root)
+        if free is None or needed <= free:
+            return True
+        self._add_warning(
+            task.virtual_path,
+            f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
+            f"(필요 {format_size(needed)}, 여유 {format_size(free)}, "
+            f"임시 폴더: {self._temp_root.parent})",
+        )
+        return False
 
     def _build_stats(
         self,
@@ -1315,7 +1517,16 @@ class ScanEngine:
         dirs = 0
         total_size = 0
         max_depth = 0
+        created_present = 0
+        by_source: dict[str, list[int]] = {}
         for e in self._entries:
+            counts = by_source.get(e.source)
+            if counts is None:
+                counts = by_source[e.source] = [0, 0]
+            counts[1] += 1
+            if e.created_at is not None:
+                counts[0] += 1
+                created_present += 1
             if e.archive_depth > max_depth:
                 max_depth = e.archive_depth
             if e.kind == EntryKind.DIRECTORY:
@@ -1344,4 +1555,12 @@ class ScanEngine:
             cancelled=self.cancel_event.is_set(),
             worker_count=worker_count,
             input_paths=input_paths,
+            created_present=created_present,
+            created_missing=len(self._entries) - created_present,
+            created_by_source={
+                source: (by_source[source][0], by_source[source][1])
+                for source in (SOURCE_FILESYSTEM, SOURCE_ZIP, SOURCE_7Z, SOURCE_TAR)
+                if source in by_source
+            },
+            archives_without_created=self._archives_without_created,
         )

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,9 +17,17 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QUrl,
     Signal,
 )
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import (
+    QDesktopServices,
+    QDragEnterEvent,
+    QDropEvent,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -44,9 +54,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import APP_NAME, __version__
+from . import APP_NAME, __version__, logsetup
 from .exporter import export_to_excel
 from .models import (
+    CREATED_MISSING_HINTS,
     FileEntry,
     ScanOptions,
     ScanResult,
@@ -62,6 +73,8 @@ from .scanner import (
 )
 from .theme import apply_theme, assets_dir
 
+log = logging.getLogger("deeplister.ui")
+
 
 class FileEntryTableModel(QAbstractTableModel):
     """Virtual table model backed directly by list[FileEntry] for smooth large-list rendering."""
@@ -73,7 +86,6 @@ class FileEntryTableModel(QAbstractTableModel):
         "생성 날짜",
         "수정된 날짜",
         "용량 (Bytes)",
-        "용량",
         "구분",
     )
 
@@ -142,8 +154,6 @@ class FileEntryTableModel(QAbstractTableModel):
             if col == 5:
                 return f"{entry.size:,}"
             if col == 6:
-                return format_size(entry.size)
-            if col == 7:
                 return entry.kind_label
 
         if role == self.SORT_ROLE:
@@ -157,20 +167,25 @@ class FileEntryTableModel(QAbstractTableModel):
                 return format_datetime(entry.created_at)
             if col == 4:
                 return format_datetime(entry.modified_at)
-            if col in (5, 6):
+            if col == 5:
                 return entry.size
-            if col == 7:
+            if col == 6:
                 return entry.kind_label
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in (0, 5, 6):
+            if col in (0, 5):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            if col in (3, 4, 7):
+            if col in (3, 4, 6):
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        if role == Qt.ItemDataRole.ToolTipRole and col in (1, 2):
-            return f"{entry.directory}{os.sep}{entry.name}"
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if col in (1, 2):
+                return f"{entry.directory}{os.sep}{entry.name}"
+            if col == 3 and entry.created_at is None:
+                return CREATED_MISSING_HINTS.get(entry.source)
+            if col == 5:
+                return format_size(entry.size)
 
         return None
 
@@ -283,6 +298,7 @@ class ScanWorkerThread(QThread):
         self._cancel_event.set()
 
     def run(self) -> None:
+        threading.current_thread().name = "Scan"
         try:
             engine = ScanEngine(
                 options=self._options,
@@ -290,27 +306,54 @@ class ScanWorkerThread(QThread):
                 cancel_event=self._cancel_event,
             )
             result = engine.scan(self._input_paths)
+            log_path = logsetup.current_log_path()
+            if log_path is not None:
+                result.stats.log_path = str(log_path)
             self.finished_result.emit(result)
         except Exception as exc:
+            log.exception("스캔이 예외로 중단되었습니다")
             self.failed.emit(str(exc))
 
 
 class ExportWorkerThread(QThread):
     """Background Qt thread for Excel generation."""
 
-    finished_path = Signal(str)
+    finished_path = Signal(str, str)  # saved .xlsx path, saved .log path ("" when not saved)
     failed = Signal(str)
 
-    def __init__(self, result: ScanResult, output_path: str) -> None:
+    def __init__(
+        self,
+        result: ScanResult,
+        output_path: str,
+        log_offset: int | None = None,
+    ) -> None:
         super().__init__()
         self._result = result
         self._output_path = output_path
+        # Byte offset where this scan's records start in the session log; None = don't save a log
+        self._log_offset = log_offset
 
     def run(self) -> None:
+        threading.current_thread().name = "Export"
         try:
+            started = time.perf_counter()
             saved = export_to_excel(self._result, self._output_path)
-            self.finished_path.emit(str(saved))
+            log.info(
+                "Excel 저장 완료: %s | %d행 | %.2f초",
+                saved,
+                len(self._result.entries),
+                time.perf_counter() - started,
+            )
+            log_copy = ""
+            if self._log_offset is not None:
+                try:
+                    copied = logsetup.export_log_slice(saved.with_suffix(".log"), self._log_offset)
+                    log_copy = str(copied) if copied is not None else ""
+                except OSError:
+                    log.exception("로그 파일을 Excel 옆에 저장하지 못했습니다")
+            self.finished_path.emit(str(saved), log_copy)
         except Exception as exc:
+            log.exception("Excel 저장 실패: %s", self._output_path)
             self.failed.emit(str(exc))
 
 
@@ -395,6 +438,7 @@ class MainWindow(QMainWindow):
         self._is_scanning = False
         self._is_exporting = False
         self._last_export_path: Path | None = None
+        self._scan_log_offset = 0
 
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
@@ -565,11 +609,19 @@ class MainWindow(QMainWindow):
         self.chk_open_after_export = QCheckBox("저장 후 Excel 바로 열기")
         self.chk_open_after_export.setChecked(True)
 
+        self.chk_save_log = QCheckBox("로그(.log)도 함께 저장")
+        self.chk_save_log.setChecked(False)
+        self.chk_save_log.setToolTip(
+            "Excel 파일과 같은 위치·같은 이름으로 이번 스캔의 상세 로그(.log)를 저장합니다.\n"
+            "압축파일별 생성/수정 시각 기록 현황과 오류의 상세 원인이 담깁니다."
+        )
+
         action_row.addWidget(self.btn_scan)
         action_row.addWidget(self.btn_stop)
         action_row.addSpacing(8)
         action_row.addWidget(self.btn_export)
         action_row.addWidget(self.chk_open_after_export)
+        action_row.addWidget(self.chk_save_log)
         action_row.addStretch(1)
 
         # Stats badges
@@ -601,8 +653,17 @@ class MainWindow(QMainWindow):
         self.lbl_current_path.setProperty("muted", True)
         self.lbl_current_path.setMinimumWidth(120)
 
+        self.btn_open_log = QPushButton("로그 열기")
+        self.btn_open_log.setToolTip("현재 실행 중 기록된 상세 로그 파일을 엽니다.")
+        self.btn_open_log.clicked.connect(self._open_log_file)
+        self.btn_open_log_dir = QPushButton("로그 폴더")
+        self.btn_open_log_dir.setToolTip("로그 파일이 저장되는 폴더를 엽니다. (최근 30개 보관)")
+        self.btn_open_log_dir.clicked.connect(self._open_log_dir)
+
         prog_row.addWidget(self.progress_bar)
         prog_row.addWidget(self.lbl_current_path, 1)
+        prog_row.addWidget(self.btn_open_log)
+        prog_row.addWidget(self.btn_open_log_dir)
         opt_outer.addLayout(prog_row)
 
         top_layout.addWidget(options_panel)
@@ -651,7 +712,7 @@ class MainWindow(QMainWindow):
         hdr = self.table_view.horizontalHeader()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        col_widths = (55, 340, 210, 145, 145, 105, 85, 125)
+        col_widths = (55, 340, 210, 145, 145, 115, 125)
         for idx, width in enumerate(col_widths):
             self.table_view.setColumnWidth(idx, width)
 
@@ -807,6 +868,24 @@ class MainWindow(QMainWindow):
         self.spin_threads.setEnabled(not busy)
         self.spin_depth.setEnabled(not busy and scan_arc_enabled)
 
+        logging_on = logsetup.current_log_path() is not None
+        self.chk_save_log.setEnabled(logging_on and not busy)
+        self.btn_open_log.setEnabled(logging_on)
+        self.btn_open_log_dir.setEnabled(logging_on)
+
+    def _open_log_file(self) -> None:
+        path = logsetup.current_log_path()
+        if path is None:
+            return
+        logsetup.current_log_size()  # flush pending records before the viewer reads the file
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _open_log_dir(self) -> None:
+        path = logsetup.current_log_path()
+        if path is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
     def start_scan(self) -> None:
         if not self._input_paths or self._is_busy() or self._scan_thread is not None:
             return
@@ -821,6 +900,7 @@ class MainWindow(QMainWindow):
 
         self._is_scanning = True
         self._last_result = None
+        self._scan_log_offset = logsetup.current_log_size()
         self.table_model.clear()
         self.warning_model.clear()
         self.tabs.setTabText(0, "파일 목록 (0)")
@@ -889,6 +969,8 @@ class MainWindow(QMainWindow):
                 f"최대 압축 깊이 {stats.max_depth_seen}단계 "
                 f"({stats.elapsed_seconds:.2f}초, 스레드 {stats.worker_count}개)"
             )
+            if stats.created_missing:
+                msg += f" · 생성 날짜 없음 {stats.created_missing:,}개"
         self.lbl_current_path.setText(msg)
         self.status_bar.showMessage(msg)
         self._apply_filter_now()
@@ -966,7 +1048,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("Excel 저장 중...")
         self.status_bar.showMessage(f"Excel 파일 생성 중: {save_path}")
 
-        thread = ExportWorkerThread(self._last_result, save_path)
+        log_offset = self._scan_log_offset if self.chk_save_log.isChecked() else None
+        thread = ExportWorkerThread(self._last_result, save_path, log_offset)
         thread.finished_path.connect(self._on_export_finished)
         thread.failed.connect(self._on_export_failed)
         thread.finished.connect(self._on_export_thread_cleanup)
@@ -974,13 +1057,16 @@ class MainWindow(QMainWindow):
         self._update_button_states()
         thread.start()
 
-    def _on_export_finished(self, saved_path: str) -> None:
+    def _on_export_finished(self, saved_path: str, log_copy_path: str = "") -> None:
         self._is_exporting = False
         self._last_export_path = Path(saved_path)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("저장 완료")
-        self.status_bar.showMessage(f"Excel 저장 완료: {saved_path}")
+        status = f"Excel 저장 완료: {saved_path}"
+        if log_copy_path:
+            status += f" · 로그: {Path(log_copy_path).name}"
+        self.status_bar.showMessage(status)
         self._update_button_states()
 
         if self.chk_open_after_export.isChecked():
@@ -993,10 +1079,11 @@ class MainWindow(QMainWindow):
                     f"Excel 파일이 저장되었습니다:\n{saved_path}\n\n(자동 열기 실패: {exc})",
                 )
         else:
+            detail = f"\n\n로그 파일:\n{log_copy_path}" if log_copy_path else ""
             QMessageBox.information(
                 self,
                 "저장 완료",
-                f"Excel 파일이 성공적으로 저장되었습니다:\n{saved_path}",
+                f"Excel 파일이 성공적으로 저장되었습니다:\n{saved_path}{detail}",
             )
 
     def _on_export_failed(self, error_msg: str) -> None:
@@ -1045,7 +1132,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run_gui(smoke_test: bool = False, initial_paths: list[str] | None = None) -> int:
+def run_gui(
+    smoke_test: bool = False,
+    initial_paths: list[str] | None = None,
+    log_dir: str | None = None,
+) -> int:
     """Launch the DeepLister Qt application."""
     app = QApplication.instance()
     if app is None:
@@ -1053,15 +1144,21 @@ def run_gui(smoke_test: bool = False, initial_paths: list[str] | None = None) ->
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(__version__)
 
-    window = MainWindow()
-    if initial_paths:
-        window.add_paths(initial_paths)
+    logsetup.start_file_logging(log_dir)
+    logsetup.install_exception_hooks()
+    try:
+        window = MainWindow()
+        if initial_paths:
+            window.add_paths(initial_paths)
 
-    if smoke_test:
+        if smoke_test:
+            window.show()
+            app.processEvents()
+            window.close()
+            return 0
+
         window.show()
-        app.processEvents()
-        window.close()
-        return 0
-
-    window.show()
-    return app.exec()
+        return app.exec()
+    finally:
+        log.info("===== 세션 종료 =====")
+        logsetup.stop_file_logging()

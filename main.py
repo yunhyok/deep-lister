@@ -25,6 +25,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="GUI 초기화를 검증하고 즉시 종료합니다.",
     )
     parser.add_argument(
+        "--log-dir",
+        metavar="DIR",
+        help="상세 로그 파일을 저장할 폴더 (기본: %%LOCALAPPDATA%%\\DeepLister\\logs)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"{APP_NAME} {__version__}",
@@ -34,7 +39,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return run_gui(smoke_test=args.smoke_test, initial_paths=args.paths or None)
+    return run_gui(
+        smoke_test=args.smoke_test,
+        initial_paths=args.paths or None,
+        log_dir=args.log_dir,
+    )
 
 
 if __name__ == "__main__":
