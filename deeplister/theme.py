@@ -179,6 +179,10 @@ def apply_theme(window: QWidget) -> None:
         QAbstractItemView:focus, QTextEdit:focus, QPlainTextEdit:focus {
             border: 1px solid #8fc1ff;
         }
+        QLineEdit:read-only {
+            background: #25282e;
+            border-color: #4d5563;
+        }
         QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled, QAbstractItemView:disabled {
             color: #929ba8;
             background: #292d33;

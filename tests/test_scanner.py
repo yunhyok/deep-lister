@@ -8,6 +8,7 @@ import os
 import struct
 import tarfile
 import threading
+import time
 import zipfile
 import zlib
 from datetime import datetime, timezone
@@ -419,3 +420,239 @@ def test_disk_full_during_nested_extraction_reports_temp_folder(
     assert "7z 중첩 압축파일 추출 오류" in reason
     assert "No space left on device" in reason
     assert "임시 폴더(" in reason and "여유 공간" in reason
+
+
+def _nested_names(result) -> set[str]:
+    return {e.name for e in result.entries}
+
+
+def test_custom_temp_dir_is_used_and_cleaned_up(tmp_path: Path, monkeypatch) -> None:
+    """Nested archives are unpacked in ScanOptions.temp_dir, which is left empty afterwards."""
+    data = tmp_path / "data"
+    data.mkdir()
+    _make_7z_with_nested_zip(data / "outer.7z")  # nested zip is extracted by py7zr
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as zf:
+        zf.writestr("spooled.txt", b"spooled")
+    with zipfile.ZipFile(data / "outer.zip", "w") as zf:  # nested zip is spooled from a stream
+        zf.writestr("inner2.zip", inner.getvalue())
+    work = tmp_path / "work"
+    work.mkdir()
+
+    temp_files: list[Path] = []
+    real_cleanup = ScanEngine._safe_cleanup
+
+    def _record_cleanup(self, path: Path) -> None:
+        if path.is_file():
+            temp_files.append(path)
+        real_cleanup(self, path)
+
+    monkeypatch.setattr(ScanEngine, "_safe_cleanup", _record_cleanup)
+
+    # max_memory_archive_bytes=0: nothing is kept in memory, every nested archive goes to disk
+    options = ScanOptions(max_workers=2, max_memory_archive_bytes=0, temp_dir=str(work))
+    result = ScanEngine(options).scan([data])
+
+    assert not result.warnings
+    assert {"deep.txt", "spooled.txt"} <= _nested_names(result)
+    assert len(temp_files) == 2
+    for path in temp_files:
+        assert path.parent.parent == work  # <temp_dir>/deeplister_xxxx/nested….bin
+        assert path.parent.name.startswith("deeplister_")
+    assert list(work.iterdir()) == []
+
+
+def test_unusable_temp_dir_falls_back_to_system_temp_with_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+
+    # 1) The folder does not exist (drive unplugged, typo in --temp-dir, ...)
+    missing = tmp_path / "no_such_folder"
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(missing))).scan([archive])
+    assert "deep.txt" in _nested_names(result)  # scanned anyway, in the system temp folder
+    assert [w.path for w in result.warnings] == [str(missing)]
+    assert "시스템 기본 임시 폴더" in result.warnings[0].reason
+    assert "폴더를 찾을 수 없습니다" in result.warnings[0].reason
+    assert not missing.exists()
+    assert scanner_module.temp_dir_problem(missing) == "폴더를 찾을 수 없습니다"
+
+    # 2) The folder exists but nothing can be created in it
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    real_mkdir = os.mkdir
+
+    def _deny_inside_locked(path, *args, **kwargs):
+        if Path(path).parent == locked:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "mkdir", _deny_inside_locked)
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(locked))).scan([archive])
+    assert "deep.txt" in _nested_names(result)
+    assert [w.path for w in result.warnings] == [str(locked)]
+    assert "시스템 기본 임시 폴더" in result.warnings[0].reason
+    assert "폴더에 쓸 수 없습니다" in result.warnings[0].reason
+    assert list(locked.iterdir()) == []
+
+    # A usable folder reports no problem and the probe leaves nothing behind
+    monkeypatch.undo()
+    assert scanner_module.temp_dir_problem(locked) is None
+    assert list(locked.iterdir()) == []
+
+
+def test_temp_dir_inside_a_scan_target_is_not_listed(tmp_path: Path) -> None:
+    """The scan's own work folder must not show up when the temp folder is being scanned too."""
+    _make_7z_with_nested_zip(tmp_path / "outer.7z")
+    work = tmp_path / "work"
+    work.mkdir()
+
+    options = ScanOptions(max_workers=2, include_empty_dirs=True, temp_dir=str(work))
+    result = ScanEngine(options).scan([tmp_path])
+
+    assert not result.warnings
+    assert _nested_names(result) == {"outer.7z", "inner.zip", "top.txt", "deep.txt", "work"}
+    assert not any("deeplister_" in e.directory for e in result.entries)
+
+
+# --- Temp-folder space budget -------------------------------------------------------------
+
+
+def _stored_zip(member: str, payload_size: int = 20_000) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr(member, b"x" * payload_size)
+    return buf.getvalue()
+
+
+def _limit_temp_space(monkeypatch, capacity: int) -> None:
+    """Make the scanner see a temp drive that holds only `capacity` bytes."""
+
+    def _free(path: Path) -> int:
+        used = 0
+        with os.scandir(path) as it:
+            for de in it:
+                try:
+                    used += de.stat().st_size
+                except OSError:  # removed meanwhile
+                    pass
+        return capacity - used
+
+    monkeypatch.setattr(scanner_module, "_free_bytes", _free)
+
+
+def _scan_or_fail_on_hang(engine: ScanEngine, paths: list[Path]):
+    """Run a scan that exercises the wait logic; a deadlock fails the test instead of hanging."""
+    results = []
+    thread = threading.Thread(target=lambda: results.append(engine.scan(paths)), daemon=True)
+    thread.start()
+    thread.join(30)
+    if thread.is_alive():
+        engine.cancel_event.set()
+        raise AssertionError("scan did not finish: workers are stuck waiting for temp space")
+    # Every reservation was given back
+    assert engine._temp_reserved == engine._temp_unwritten == 0
+    assert engine._temp_pinned == engine._temp_waiters == 0
+    return results[0]
+
+
+def test_nested_archives_are_scanned_first_so_temp_space_is_reused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unpacked nested archives jump the queue: one after another fits where all at once don't."""
+    nested_size = 0
+    for i in range(4):
+        nested = _stored_zip(f"deep_{i}.txt")
+        nested_size = len(nested)
+        with py7zr.SevenZipFile(tmp_path / f"outer_{i}.7z", "w") as sz:
+            sz.writestr(nested, "inner.zip")
+    _limit_temp_space(monkeypatch, int(nested_size * 1.5))  # room for one nested archive
+
+    engine = ScanEngine(ScanOptions(max_workers=1))
+    result = _scan_or_fail_on_hang(engine, [tmp_path])
+
+    assert not result.warnings
+    assert {f"deep_{i}.txt" for i in range(4)} <= _nested_names(result)
+
+
+def _make_zip_with_two_large_nested_zips(path: Path) -> int:
+    first, second = _stored_zip("deep_1.txt"), _stored_zip("deep_2.txt")
+    assert len(first) == len(second)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("n1.zip", first)
+        zf.writestr("n2.zip", second)
+    return len(first)
+
+
+def test_worker_waits_for_temp_space_instead_of_failing(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    archive = tmp_path / "outer.zip"
+    nested_size = _make_zip_with_two_large_nested_zips(archive)
+    _limit_temp_space(monkeypatch, int(nested_size * 1.5))  # n1.zip and n2.zip don't fit together
+
+    # n2.zip can only be spooled after the second worker has scanned and removed n1.zip.
+    # Hold n1.zip back until the first worker is really waiting, so the wait is not left to timing.
+    waiters_seen: list[int] = []
+    real_scan_zip = ScanEngine._scan_zip
+
+    def _scan_zip_after_parent_waits(self, task) -> None:
+        if task.virtual_path.endswith("n1.zip"):
+            deadline = time.monotonic() + 20
+            while self._temp_waiters == 0 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            waiters_seen.append(self._temp_waiters)
+        real_scan_zip(self, task)
+
+    monkeypatch.setattr(ScanEngine, "_scan_zip", _scan_zip_after_parent_waits)
+
+    engine = ScanEngine(ScanOptions(max_workers=2, max_memory_archive_bytes=0))
+    with caplog.at_level("INFO", logger="deeplister.scanner"):
+        result = _scan_or_fail_on_hang(engine, [archive])
+
+    assert waiters_seen == [1]
+    assert not result.warnings
+    assert {"deep_1.txt", "deep_2.txt"} <= _nested_names(result)
+    assert "임시 폴더 공간 대기 후 확보" in caplog.text
+
+
+def test_single_worker_does_not_wait_for_space_only_it_could_free(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.zip"
+    nested_size = _make_zip_with_two_large_nested_zips(archive)
+    _limit_temp_space(monkeypatch, int(nested_size * 1.5))
+
+    # With one worker nobody else can scan n1.zip in the meantime: report n2.zip, don't hang
+    engine = ScanEngine(ScanOptions(max_workers=1, max_memory_archive_bytes=0))
+    result = _scan_or_fail_on_hang(engine, [archive])
+
+    names = _nested_names(result)
+    assert "deep_1.txt" in names and "deep_2.txt" not in names
+    assert {"n1.zip", "n2.zip"} <= names  # the archive itself is still listed
+    assert len(result.warnings) == 1
+    assert result.warnings[0].path.endswith("n2.zip")
+    assert "임시 폴더 여유 공간이 부족" in result.warnings[0].reason
+
+
+def test_waiting_gives_up_when_only_the_archive_being_scanned_occupies_the_space(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """mid.7z sits in the temp folder while it is scanned, so waiting cannot make room for inner.zip."""
+    inner = _stored_zip("deep.txt")
+    mid = io.BytesIO()
+    with py7zr.SevenZipFile(mid, "w") as sz:
+        sz.writestr(inner, "inner.zip")
+    with py7zr.SevenZipFile(tmp_path / "top.7z", "w") as sz:
+        sz.writestr(mid.getvalue(), "mid.7z")
+    _limit_temp_space(monkeypatch, len(inner))  # mid.7z fits, inner.zip fits, both do not
+
+    engine = ScanEngine(ScanOptions(max_workers=2))
+    result = _scan_or_fail_on_hang(engine, [tmp_path / "top.7z"])
+
+    names = _nested_names(result)
+    assert {"top.7z", "mid.7z", "inner.zip"} <= names and "deep.txt" not in names
+    assert len(result.warnings) == 1
+    assert result.warnings[0].path.endswith("mid.7z")
+    assert "임시 폴더 여유 공간이 부족" in result.warnings[0].reason

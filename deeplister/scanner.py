@@ -246,6 +246,23 @@ def _free_bytes(path: Path) -> int | None:
         return None
 
 
+def temp_dir_problem(path: str | os.PathLike[str]) -> str | None:
+    """Return why path cannot hold temporary files (user-facing text), or None when it can.
+
+    Writability is tested by really creating a folder: os.access() ignores ACLs on Windows, and
+    tempfile.mkdtemp() keeps retrying a denied mkdir there (up to TMP_MAX times) before failing.
+    """
+    if not os.path.isdir(path):
+        return "폴더를 찾을 수 없습니다"
+    probe = os.path.join(path, f"deeplister_probe_{uuid.uuid4().hex}")
+    try:
+        os.mkdir(probe)
+        os.rmdir(probe)
+    except OSError as exc:
+        return f"폴더에 쓸 수 없습니다: {exc}"
+    return None
+
+
 def _normalize_member_relpath(member_name: str) -> str:
     return member_name.replace("\\", "/").strip("/")
 
@@ -360,6 +377,7 @@ class _ArchiveTask:
     source_bytes: bytes | None = None
     memory_charge: int = 0
     cleanup_path: Path | None = None
+    temp_charge: int = 0  # temp-folder bytes reserved for cleanup_path
     started: float = 0.0
 
 
@@ -376,9 +394,14 @@ class ScanEngine:
         self.progress_callback = progress_callback
         self.cancel_event = cancel_event or threading.Event()
 
-        self._task_queue: queue.Queue[_DirTask | _ArchiveTask] = queue.Queue()
+        # (priority, sequence, task): nested archives that already hold memory or temp-folder
+        # space come first so that the space is given back as early as possible
+        self._task_queue: queue.PriorityQueue[tuple[int, int, _DirTask | _ArchiveTask]] = (
+            queue.PriorityQueue()
+        )
         self._pending_lock = threading.Lock()
         self._pending_count = 0
+        self._task_seq = 0
         self._queued_bytes = 0
         self._done_event = threading.Event()
 
@@ -393,6 +416,15 @@ class ScanEngine:
         self._last_progress_time = 0.0
         self._start_time = 0.0
         self._temp_root: Path | None = None
+        self._temp_root_key = ""
+        self._worker_count = 1
+
+        # Temp-folder budget shared by all workers (see _reserve_temp)
+        self._temp_cond = threading.Condition()
+        self._temp_reserved = 0  # bytes of nested archives in the temp folder or being unpacked
+        self._temp_unwritten = 0  # part of _temp_reserved not written yet (free space lacks it)
+        self._temp_pinned = 0  # reserved bytes of archives whose worker waits for more space
+        self._temp_waiters = 0
 
     def scan(self, input_paths: list[str | Path]) -> ScanResult:
         """Scan all provided files, folders, and archives recursively using worker threads."""
@@ -410,6 +442,7 @@ class ScanEngine:
         # Reset queue/accounting state so ScanEngine instances are safely reusable
         with self._pending_lock:
             self._pending_count = 0
+            self._task_seq = 0
             self._queued_bytes = 0
             while True:
                 try:
@@ -431,16 +464,23 @@ class ScanEngine:
                 unique_paths.append(p)
 
         worker_count = max(1, min(32, int(self.options.max_workers)))
+        self._worker_count = worker_count
+        with self._temp_cond:
+            self._temp_reserved = self._temp_unwritten = 0
+            self._temp_pinned = self._temp_waiters = 0
 
         log.info("----- 스캔 시작: 대상 %d개 | %s", len(unique_paths), self.options)
         for p in unique_paths:
             log.info("대상: %s", p)
 
-        with tempfile.TemporaryDirectory(prefix="deeplister_") as temp_dir:
+        temp_context, temp_origin = self._open_temp_dir()
+        with temp_context as temp_dir:
             self._temp_root = Path(temp_dir)
+            self._temp_root_key = os.path.normcase(os.path.realpath(temp_dir))
             free = _free_bytes(self._temp_root)
             log.info(
-                "임시 작업 폴더: %s (여유 공간 %s)",
+                "임시 작업 폴더(%s): %s (여유 공간 %s)",
+                temp_origin,
                 temp_dir,
                 format_size(free) if free is not None else "알 수 없음",
             )
@@ -491,6 +531,27 @@ class ScanEngine:
         self._log_summary(stats)
         return ScanResult(entries=list(self._entries), warnings=list(self._warnings), stats=stats)
 
+    def _open_temp_dir(self) -> tuple[tempfile.TemporaryDirectory[str], str]:
+        """Create this scan's private work folder; returns (context manager, origin label).
+
+        A user-selected folder that is missing or not writable must not abort the scan: warn
+        and fall back to the system temp directory.
+        """
+        custom = self.options.temp_dir
+        if custom:
+            problem = temp_dir_problem(custom)
+            if problem is None:
+                try:
+                    return tempfile.TemporaryDirectory(prefix="deeplister_", dir=custom), "사용자 지정"
+                except OSError as exc:
+                    problem = f"폴더에 쓸 수 없습니다: {exc}"
+            self._add_warning(
+                str(custom),
+                "지정한 임시 폴더를 사용할 수 없어 시스템 기본 임시 폴더"
+                f"({tempfile.gettempdir()})를 사용합니다 — {problem}",
+            )
+        return tempfile.TemporaryDirectory(prefix="deeplister_"), "시스템 기본"
+
     def _try_reserve_memory(self, nbytes: int) -> bool:
         """Reserve from the global in-memory nested-archive budget."""
         if nbytes <= 0:
@@ -509,16 +570,100 @@ class ScanEngine:
         with self._pending_lock:
             self._queued_bytes = max(0, self._queued_bytes - nbytes)
 
+    def _reserve_temp(self, task: _ArchiveTask, path: str, count: int, nbytes: int) -> bool:
+        """Set aside temp-folder space for nested archives of `task` before unpacking them.
+
+        Workers unpack at the same time, so a free-space check per worker would let them
+        overfill the disk together. When the space is taken by nested archives that other
+        workers have yet to scan, wait for them. Returns False (with a warning, unless the scan
+        was cancelled) when the archives cannot fit however long this worker waits.
+        """
+        root = self._temp_root
+        if root is None or nbytes <= 0:
+            return True
+        free: int | None = None
+        reserved = False
+        wait_started = 0.0
+        with self._temp_cond:
+            try:
+                while not self.cancel_event.is_set():
+                    free = _free_bytes(root)
+                    if free is None or nbytes <= free - self._temp_unwritten:
+                        self._temp_reserved += nbytes
+                        self._temp_unwritten += nbytes
+                        reserved = True
+                        break
+                    if not wait_started:
+                        wait_started = time.perf_counter()
+                        self._temp_waiters += 1
+                        self._temp_pinned += task.temp_charge
+                    # Space comes back only when a worker that is not waiting finishes a nested
+                    # archive. The archives waiting workers are scanning stay where they are, and
+                    # if every worker waited nobody would be left to scan the queued ones.
+                    reclaimable = self._temp_reserved - self._temp_pinned
+                    if nbytes > free + reclaimable or self._temp_waiters >= self._worker_count:
+                        break
+                    self._temp_cond.wait(0.2)
+            finally:
+                if wait_started:
+                    self._temp_waiters -= 1
+                    self._temp_pinned -= task.temp_charge
+
+        if wait_started:
+            log.info(
+                "임시 폴더 공간 대기 %s: %s | 필요 %s | %.1f초",
+                "후 확보" if reserved else "종료(확보 실패)",
+                path,
+                format_size(nbytes),
+                time.perf_counter() - wait_started,
+            )
+        if reserved:
+            return True
+        if not self.cancel_event.is_set() and free is not None:
+            self._add_warning(
+                path,
+                f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
+                f"(필요 {format_size(nbytes)}, 여유 {format_size(free)}, "
+                f"임시 폴더: {root.parent}) — 옵션의 '임시 폴더'를 여유 공간이 충분한 "
+                "드라이브로 바꿔 보세요.",
+            )
+        return False
+
+    def _temp_written(self, nbytes: int) -> None:
+        """Reserved bytes are on disk (or will never be): the free-space figure covers them now."""
+        if nbytes <= 0:
+            return
+        with self._temp_cond:
+            self._temp_unwritten = max(0, self._temp_unwritten - nbytes)
+            self._temp_cond.notify_all()
+
+    def _release_temp(self, nbytes: int) -> None:
+        if nbytes <= 0:
+            return
+        with self._temp_cond:
+            self._temp_reserved = max(0, self._temp_reserved - nbytes)
+            self._temp_cond.notify_all()
+
+    def _release_task_resources(self, task: _ArchiveTask) -> None:
+        self._release_memory(task.memory_charge)
+        task.source_bytes = None
+        if task.cleanup_path is not None:
+            self._safe_cleanup(task.cleanup_path)
+        self._release_temp(task.temp_charge)
+
     def _enqueue(self, task: _DirTask | _ArchiveTask) -> None:
         if self.cancel_event.is_set():
             if isinstance(task, _ArchiveTask):
-                self._release_memory(task.memory_charge)
-                if task.cleanup_path is not None:
-                    self._safe_cleanup(task.cleanup_path)
+                self._release_task_resources(task)
             return
+        holds_space = isinstance(task, _ArchiveTask) and (
+            task.cleanup_path is not None or task.source_bytes is not None
+        )
         with self._pending_lock:
             self._pending_count += 1
-        self._task_queue.put(task)
+            self._task_seq += 1
+            seq = self._task_seq
+        self._task_queue.put((0 if holds_space else 1, seq, task))
 
     def _finish_task(self) -> None:
         with self._pending_lock:
@@ -529,7 +674,7 @@ class ScanEngine:
     def _worker_loop(self) -> None:
         while not self._done_event.is_set() and not self.cancel_event.is_set():
             try:
-                task = self._task_queue.get(timeout=0.05)
+                _priority, _seq, task = self._task_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
 
@@ -544,10 +689,7 @@ class ScanEngine:
                 self._add_warning(target, self._describe_error("처리 중 오류", exc), exc=exc)
             finally:
                 if isinstance(task, _ArchiveTask):
-                    self._release_memory(task.memory_charge)
-                    task.source_bytes = None
-                    if task.cleanup_path is not None:
-                        self._safe_cleanup(task.cleanup_path)
+                    self._release_task_resources(task)
                 self._finish_task()
 
     def _safe_cleanup(self, path: Path) -> None:
@@ -750,6 +892,11 @@ class ScanEngine:
                 for de in it:
                     if self.cancel_event.is_set():
                         return
+                    if (
+                        de.name.startswith("deeplister_")
+                        and os.path.normcase(de.path) == self._temp_root_key
+                    ):
+                        continue  # this scan's own work folder inside a scan target
                     has_children = True
                     try:
                         if de.is_dir(follow_symlinks=False):
@@ -853,6 +1000,7 @@ class ScanEngine:
 
     def _enqueue_nested_stream(
         self,
+        parent: _ArchiveTask,
         nested_type: str,
         nested_virtual_path: str,
         next_depth: int,
@@ -897,6 +1045,8 @@ class ScanEngine:
                     actual_size += len(chunk)
                     if spilled_fp is None:
                         if actual_size > threshold and self._temp_root is not None:
+                            # The header understated the size, so the real one is unknown:
+                            # spooled without a temp-space reservation
                             spilled_path = self._temp_root / f"nested_{uuid.uuid4().hex}.bin"
                             spilled_fp = open(spilled_path, "wb")
                             for prev in chunks:
@@ -952,21 +1102,26 @@ class ScanEngine:
         else:
             if self._temp_root is None:
                 return
+            temp_charge = max(declared_size, 0)
+            if not self._reserve_temp(parent, nested_virtual_path, 1, temp_charge):
+                return
             spilled_path = self._temp_root / f"nested_{uuid.uuid4().hex}.bin"
+            spooled = False
             try:
                 with open(spilled_path, "wb") as out_fp:
-                    while True:
-                        if self.cancel_event.is_set():
-                            out_fp.close()
-                            self._safe_cleanup(spilled_path)
-                            return
+                    while not self.cancel_event.is_set():
                         chunk = stream.read(1024 * 1024)
                         if not chunk:
+                            spooled = True
                             break
                         out_fp.write(chunk)
-            except Exception:
-                self._safe_cleanup(spilled_path)
-                raise
+            finally:
+                self._temp_written(temp_charge)
+                if not spooled:  # cancelled or failed
+                    self._safe_cleanup(spilled_path)
+                    self._release_temp(temp_charge)
+            if not spooled:
+                return
 
             self._enqueue(
                 _ArchiveTask(
@@ -975,6 +1130,7 @@ class ScanEngine:
                     depth=next_depth,
                     source_path=spilled_path,
                     cleanup_path=spilled_path,
+                    temp_charge=temp_charge,
                 )
             )
 
@@ -1061,6 +1217,7 @@ class ScanEngine:
                             try:
                                 with zf.open(info, "r") as member_stream:
                                     self._enqueue_nested_stream(
+                                        parent=task,
                                         nested_type=nested_type,
                                         nested_virtual_path=member_vpath,
                                         next_depth=task.depth + 1,
@@ -1196,6 +1353,7 @@ class ScanEngine:
                             if extracted is not None:
                                 with extracted:
                                     self._enqueue_nested_stream(
+                                        parent=task,
                                         nested_type=nested_type,
                                         nested_virtual_path=member_vpath,
                                         next_depth=task.depth + 1,
@@ -1249,7 +1407,8 @@ class ScanEngine:
         local_entries: list[FileEntry] = []
         candidate_dirs: dict[str, FileEntry] = {}
         non_empty_dirs: set[str] = set()
-        nested_targets: list[tuple[str, str, str]] = []  # (raw_member_name, nested_type, member_vpath)
+        # (raw_member_name, nested_type, member_vpath, uncompressed_size)
+        nested_targets: list[tuple[str, str, str, int]] = []
         nested_bytes = 0  # uncompressed size the nested archives need in the temp folder
         has_ctime_property = False  # 7z header carries the optional creation-time property
         note = ""
@@ -1336,7 +1495,7 @@ class ScanEngine:
                                         archive_depth=task.depth,
                                     )
                                 )
-                            nested_targets.append((raw_name, nested_type, member_vpath))
+                            nested_targets.append((raw_name, nested_type, member_vpath, size))
                             nested_bytes += size
                         else:
                             local_entries.append(
@@ -1388,8 +1547,9 @@ class ScanEngine:
                                         archive_depth=task.depth,
                                     )
                                 )
-                            nested_targets.append((fi.filename, nested_type, member_vpath))
-                            nested_bytes += int(fi.uncompressed or 0)
+                            size = int(fi.uncompressed or 0)
+                            nested_targets.append((fi.filename, nested_type, member_vpath, size))
+                            nested_bytes += size
                         else:
                             local_entries.append(
                                 FileEntry(
@@ -1407,13 +1567,13 @@ class ScanEngine:
                 # (never writes raw archive paths to disk: immune to ../ traversal & Windows MAX_PATH)
                 if nested_targets and not self.cancel_event.is_set():
                     if task.depth + 1 > self.options.max_archive_depth:
-                        for _, _, member_vpath in nested_targets:
+                        for _, _, member_vpath, _ in nested_targets:
                             self._add_warning(
                                 member_vpath,
                                 f"최대 압축 중첩 깊이({self.options.max_archive_depth})를 초과하여 탐색을 중단했습니다.",
                             )
-                    elif self._temp_root is not None and self._temp_space_ok(
-                        task, len(nested_targets), nested_bytes
+                    elif self._temp_root is not None and self._reserve_temp(
+                        task, task.virtual_path, len(nested_targets), nested_bytes
                     ):
                         factory = _Isolated7zWriterFactory(self._temp_root)
                         target_names = [t[0] for t in nested_targets]
@@ -1441,19 +1601,19 @@ class ScanEngine:
                             )
                         finally:
                             factory.close_all()
+                            self._temp_written(nested_bytes)
 
                         if extracted_ok:
-                            for raw_name, nested_type, member_vpath in nested_targets:
+                            for raw_name, nested_type, member_vpath, size in nested_targets:
                                 isolated_file = factory.outputs.get(raw_name)
                                 if isolated_file is None or not isolated_file.is_file():
                                     self._add_warning(
                                         member_vpath,
                                         "7z에서 중첩 압축파일을 추출하지 못했습니다.",
                                     )
+                                    self._release_temp(size)
                                     continue
-                                if self.cancel_event.is_set():
-                                    self._safe_cleanup(isolated_file)
-                                    continue
+                                # _enqueue cleans up and releases the reservation when cancelled
                                 self._enqueue(
                                     _ArchiveTask(
                                         archive_type=nested_type,
@@ -1461,11 +1621,13 @@ class ScanEngine:
                                         depth=task.depth + 1,
                                         source_path=isolated_file,
                                         cleanup_path=isolated_file,
+                                        temp_charge=size,
                                     )
                                 )
                         else:
                             for p in factory.outputs.values():
                                 self._safe_cleanup(p)
+                            self._release_temp(nested_bytes)
 
         except py7zr.exceptions.Bad7zFile:
             self._add_warning(task.virtual_path, "손상되었거나 유효하지 않은 7z 파일입니다.")
@@ -1486,24 +1648,6 @@ class ScanEngine:
                     local_entries.append(entry)
 
         self._finish_archive(task, SOURCE_7Z, local_entries, note)
-
-    def _temp_space_ok(self, task: _ArchiveTask, count: int, needed: int) -> bool:
-        """Check the temp folder can hold the nested archives; warn and return False if not.
-
-        Extracting anyway would fill the user's temp drive completely and then fail.
-        """
-        if self._temp_root is None:
-            return True
-        free = _free_bytes(self._temp_root)
-        if free is None or needed <= free:
-            return True
-        self._add_warning(
-            task.virtual_path,
-            f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
-            f"(필요 {format_size(needed)}, 여유 {format_size(free)}, "
-            f"임시 폴더: {self._temp_root.parent})",
-        )
-        return False
 
     def _build_stats(
         self,
