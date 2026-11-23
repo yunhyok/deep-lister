@@ -246,21 +246,27 @@ def _free_bytes(path: Path) -> int | None:
         return None
 
 
-def temp_dir_problem(path: str | os.PathLike[str]) -> str | None:
-    """Return why path cannot hold temporary files (user-facing text), or None when it can.
+def temp_dir_problem(path: str | Path) -> str | None:
+    """Return why a folder cannot serve as the temp work folder, or None when it can.
 
-    Writability is tested by really creating a folder: os.access() ignores ACLs on Windows, and
-    tempfile.mkdtemp() keeps retrying a denied mkdir there (up to TMP_MAX times) before failing.
+    The probe creates a folder itself instead of going through tempfile: on Windows, Python
+    3.12's tempfile retries a denied create up to os.TMP_MAX times when the folder exists
+    (os.access() reports every existing folder as writable there), which blocks the caller.
     """
-    if not os.path.isdir(path):
-        return "폴더를 찾을 수 없습니다"
-    probe = os.path.join(path, f"deeplister_probe_{uuid.uuid4().hex}")
+    folder = Path(path)
     try:
+        if not folder.is_dir():
+            return "폴더가 없습니다."
+        probe = folder / f"deeplister_probe_{uuid.uuid4().hex}"
         os.mkdir(probe)
         os.rmdir(probe)
     except OSError as exc:
         return f"폴더에 쓸 수 없습니다: {exc}"
     return None
+
+
+# Appended to disk-space warnings: the fix is in the user's hands
+_TEMP_DIR_HINT = "옵션의 '임시 폴더'를 여유 공간이 큰 드라이브로 바꾼 뒤 다시 스캔하세요."
 
 
 def _normalize_member_relpath(member_name: str) -> str:
@@ -473,14 +479,24 @@ class ScanEngine:
         for p in unique_paths:
             log.info("대상: %s", p)
 
-        temp_context, temp_origin = self._open_temp_dir()
-        with temp_context as temp_dir:
+        temp_parent: str | None = None
+        if self.options.temp_dir:
+            problem = temp_dir_problem(self.options.temp_dir)
+            if problem is None:
+                temp_parent = str(self.options.temp_dir)
+            else:
+                self._add_warning(
+                    str(self.options.temp_dir),
+                    f"지정한 임시 폴더를 사용할 수 없어 시스템 임시 폴더({tempfile.gettempdir()})를 "
+                    f"대신 사용했습니다: {problem}",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="deeplister_", dir=temp_parent) as temp_dir:
             self._temp_root = Path(temp_dir)
             self._temp_root_key = os.path.normcase(os.path.realpath(temp_dir))
             free = _free_bytes(self._temp_root)
             log.info(
-                "임시 작업 폴더(%s): %s (여유 공간 %s)",
-                temp_origin,
+                "임시 작업 폴더: %s (여유 공간 %s)",
                 temp_dir,
                 format_size(free) if free is not None else "알 수 없음",
             )
@@ -530,27 +546,6 @@ class ScanEngine:
         self._emit_progress(force=True)
         self._log_summary(stats)
         return ScanResult(entries=list(self._entries), warnings=list(self._warnings), stats=stats)
-
-    def _open_temp_dir(self) -> tuple[tempfile.TemporaryDirectory[str], str]:
-        """Create this scan's private work folder; returns (context manager, origin label).
-
-        A user-selected folder that is missing or not writable must not abort the scan: warn
-        and fall back to the system temp directory.
-        """
-        custom = self.options.temp_dir
-        if custom:
-            problem = temp_dir_problem(custom)
-            if problem is None:
-                try:
-                    return tempfile.TemporaryDirectory(prefix="deeplister_", dir=custom), "사용자 지정"
-                except OSError as exc:
-                    problem = f"폴더에 쓸 수 없습니다: {exc}"
-            self._add_warning(
-                str(custom),
-                "지정한 임시 폴더를 사용할 수 없어 시스템 기본 임시 폴더"
-                f"({tempfile.gettempdir()})를 사용합니다 — {problem}",
-            )
-        return tempfile.TemporaryDirectory(prefix="deeplister_"), "시스템 기본"
 
     def _try_reserve_memory(self, nbytes: int) -> bool:
         """Reserve from the global in-memory nested-archive budget."""
@@ -624,8 +619,7 @@ class ScanEngine:
                 path,
                 f"임시 폴더 여유 공간이 부족하여 중첩 압축파일 {count}개의 내부를 탐색하지 못했습니다 "
                 f"(필요 {format_size(nbytes)}, 여유 {format_size(free)}, "
-                f"임시 폴더: {root.parent}) — 옵션의 '임시 폴더'를 여유 공간이 충분한 "
-                "드라이브로 바꿔 보세요.",
+                f"임시 폴더: {root.parent}). {_TEMP_DIR_HINT}",
             )
         return False
 
@@ -731,7 +725,7 @@ class ScanEngine:
         if isinstance(exc, OSError) and exc.errno == errno.ENOSPC and self._temp_root is not None:
             free = _free_bytes(self._temp_root)
             free_text = format_size(free) if free is not None else "알 수 없음"
-            text += f" — 임시 폴더({self._temp_root.parent}) 여유 공간 {free_text}"
+            text += f" — 임시 폴더({self._temp_root.parent}) 여유 공간 {free_text}. {_TEMP_DIR_HINT}"
         return text
 
     def _finish_archive(

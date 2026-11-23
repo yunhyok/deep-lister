@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import QApplication
 
-import main
 from deeplister import logsetup
-from deeplister import ui as ui_module
 from deeplister.models import CREATED_MISSING_HINTS, SOURCE_ZIP
 from deeplister.ui import ExportWorkerThread, FileEntryTableModel, MainWindow
 
@@ -141,103 +141,119 @@ def test_gui_export_saves_scan_log_next_to_excel(tmp_path: Path) -> None:
         logsetup.stop_file_logging()
 
 
-def test_temp_dir_option_reaches_scan_options(tmp_path: Path) -> None:
+def _scan_and_wait(app: QApplication, win: MainWindow) -> None:
+    win.start_scan()
+    win._scan_thread.wait(10_000)
+    app.processEvents()
+
+
+def test_gui_temp_dir_is_used_validated_and_remembered(tmp_path: Path) -> None:
     app = _ensure_app()
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     with zipfile.ZipFile(data_dir / "bundle.zip", "w") as zf:
-        zf.writestr("report/summary.txt", b"hello gui")
-    work = tmp_path / "work"
-    work.mkdir()
+        zf.writestr("a.txt", b"a")
+    work_dir = tmp_path / "임시 작업"  # non-ASCII and a space must survive the settings file
+    work_dir.mkdir()
+    settings_file = tmp_path / "settings.ini"
 
-    def _scan_and_get_options():
-        win.start_scan()
-        thread = win._scan_thread
-        assert thread is not None
-        assert not win.btn_temp_browse.isEnabled()  # locked while a scan runs
-        options = thread._options
-        thread.wait(10_000)
-        app.processEvents()
-        assert win._scan_thread is None
-        return options
-
-    win = MainWindow()
+    win = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
     win.show()
-    win.add_paths([str(data_dir)])
 
-    # Default: the system temp folder is shown, there is nothing to reset
-    assert win.edit_temp_dir.isReadOnly()
+    # Default: the system temp folder, nothing to reset
+    assert win.temp_dir() is None
     assert win.edit_temp_dir.text() == tempfile.gettempdir()
-    assert win.lbl_temp_free.text().startswith("여유 ")
-    assert win.btn_temp_browse.isEnabled()
+    assert win.lbl_temp_state.text().startswith("기본값 · 여유 ")
     assert not win.btn_temp_reset.isEnabled()
-    assert _scan_and_get_options().temp_dir is None
 
-    win.set_temp_dir(str(work))
-    assert win.edit_temp_dir.text() == str(work)
-    assert win.lbl_temp_free.text().startswith("여유 ")
+    # An unusable folder is rejected and the previous choice stays
+    assert not win.set_temp_dir(str(tmp_path / "missing"))
+    assert win.temp_dir() is None
+
+    assert win.set_temp_dir(str(work_dir))
+    assert win.temp_dir() == str(work_dir)
+    assert win.edit_temp_dir.text() == str(work_dir)
+    assert win.lbl_temp_state.text().startswith("사용자 지정 · 여유 ")
     assert win.btn_temp_reset.isEnabled()
-    assert _scan_and_get_options().temp_dir == str(work)
-    assert win._last_result is not None and not win._last_result.warnings
-    assert list(work.iterdir()) == []
 
-    # A folder that does not exist (e.g. from --temp-dir) is shown as such, not hidden
-    win.set_temp_dir(str(tmp_path / "unplugged"))
-    assert win.lbl_temp_free.text() == "폴더 없음"
-
-    win.btn_temp_reset.click()
-    assert win.edit_temp_dir.text() == tempfile.gettempdir()
-    assert not win.btn_temp_reset.isEnabled()
-    assert _scan_and_get_options().temp_dir is None
-
-    # The temp folder only matters when archives are scanned
-    win.chk_scan_archives.setChecked(False)
-    assert not win.btn_temp_browse.isEnabled()
-
+    # The choice reaches the scan
+    win.add_paths([str(data_dir)])
+    win.start_scan()
+    scan_thread = win._scan_thread
+    assert scan_thread._options.temp_dir == str(work_dir)
+    assert not win.btn_temp_browse.isEnabled()  # locked while scanning
+    scan_thread.wait(10_000)
+    app.processEvents()
+    assert win._last_result is not None
+    assert not win._last_result.warnings
+    assert list(work_dir.iterdir()) == []
     win.close()
     app.processEvents()
 
+    # ...and is remembered by the next window
+    reopened = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
+    assert reopened.temp_dir() == str(work_dir)
+    assert reopened.edit_temp_dir.text() == str(work_dir)
 
-def test_temp_dir_browse_rejects_unusable_folder(tmp_path: Path, monkeypatch) -> None:
+    reopened.btn_temp_reset.click()
+    assert reopened.temp_dir() is None
+    assert reopened.edit_temp_dir.text() == tempfile.gettempdir()
+    reopened.close()
+    app.processEvents()
+
+    third = MainWindow(QSettings(str(settings_file), QSettings.Format.IniFormat))
+    assert third.temp_dir() is None
+    third.close()
+    app.processEvents()
+
+
+def test_gui_saved_temp_dir_that_disappeared_falls_back_with_a_warning(tmp_path: Path) -> None:
     app = _ensure_app()
-    good = tmp_path / "good"
-    good.mkdir()
-    bad = tmp_path / "bad"
-    bad.mkdir()
-    win = MainWindow()
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with zipfile.ZipFile(data_dir / "bundle.zip", "w") as zf:
+        zf.writestr("a.txt", b"a")
+    gone = tmp_path / "unplugged_drive"
 
-    picked: list[str] = [str(good)]
-    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: picked[0])
-    win.btn_temp_browse.click()
-    assert win._temp_dir == str(good)
-    assert list(good.iterdir()) == []  # the writability probe cleans up after itself
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("scan/temp_dir", str(gone))
+    settings.sync()
 
-    # A folder nothing can be written to is refused with a message; the selection stays
-    shown: list[str] = []
-    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, text: shown.append(text))
-    monkeypatch.setattr(
-        ui_module,
-        "temp_dir_problem",
-        lambda path: "폴더에 쓸 수 없습니다: 액세스가 거부되었습니다" if Path(path) == bad else None,
-    )
-    picked[0] = str(bad)
-    win.btn_temp_browse.click()
-    assert win._temp_dir == str(good)
-    assert len(shown) == 1 and str(bad) in shown[0] and "쓸 수 없습니다" in shown[0]
+    win = MainWindow(settings)
+    win.show()
+    assert win.temp_dir() == str(gone)  # kept: the drive may come back
+    assert "사용할 수 없음" in win.lbl_temp_state.text()
 
-    picked[0] = ""  # dialog cancelled
-    win.btn_temp_browse.click()
-    assert win._temp_dir == str(good)
-
+    win.add_paths([str(data_dir)])
+    _scan_and_wait(app, win)
+    result = win._last_result
+    assert result is not None
+    assert "a.txt" in {e.name for e in result.entries}
+    assert any("지정한 임시 폴더를 사용할 수 없어" in w.reason for w in result.warnings)
     win.close()
     app.processEvents()
 
 
-def test_temp_dir_command_line_argument(monkeypatch) -> None:
-    assert main.parse_args([]).temp_dir is None
-    assert main.parse_args(["--temp-dir", "work dir", "some.zip"]).temp_dir == "work dir"
+def test_app_starts_and_exits_cleanly(tmp_path: Path) -> None:
+    """Qt teardown crashes happen at interpreter exit: only a separate process can observe them."""
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", LOCALAPPDATA=str(tmp_path / "appdata"))
+    main_script = Path(__file__).resolve().parent.parent / "main.py"
 
-    received: dict = {}
-    monkeypatch.setattr(main, "run_gui", lambda **kwargs: received.update(kwargs) or 0)
-    assert main.main(["--temp-dir", "work dir"]) == 0
-    assert received["temp_dir"] == "work dir"
+    proc = subprocess.run(
+        [sys.executable, str(main_script), "--smoke-test", "--temp-dir", str(work_dir)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    logs = list((tmp_path / "appdata" / "DeepLister" / "logs").glob("DeepLister_*.log"))
+    assert len(logs) == 1
+    text = logs[0].read_text(encoding="utf-8-sig")
+    assert f"임시 폴더 설정: {work_dir}" in text
+    assert "세션 종료" in text
+    # A command-line temp folder applies to that run only and is not saved
+    assert not (tmp_path / "appdata" / "DeepLister" / "settings.ini").exists()

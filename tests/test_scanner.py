@@ -399,6 +399,7 @@ def test_nested_7z_extraction_is_skipped_when_temp_space_is_insufficient(
     assert len(result.warnings) == 1
     assert "임시 폴더 여유 공간이 부족" in result.warnings[0].reason
     assert "중첩 압축파일 1개" in result.warnings[0].reason
+    assert "옵션의 '임시 폴더'" in result.warnings[0].reason  # tells the user how to fix it
 
 
 def test_disk_full_during_nested_extraction_reports_temp_folder(
@@ -420,65 +421,68 @@ def test_disk_full_during_nested_extraction_reports_temp_folder(
     assert "7z 중첩 압축파일 추출 오류" in reason
     assert "No space left on device" in reason
     assert "임시 폴더(" in reason and "여유 공간" in reason
+    assert "옵션의 '임시 폴더'" in reason
+
+
+def test_custom_temp_dir_holds_nested_archives_and_is_cleaned_up(
+    tmp_path: Path, monkeypatch
+) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    extracted_to: list[Path] = []
+    original_create = scanner_module._Isolated7zWriterFactory.create
+
+    def _recording_create(self, filename):
+        writer = original_create(self, filename)
+        extracted_to.append(writer.path)
+        return writer
+
+    monkeypatch.setattr(scanner_module._Isolated7zWriterFactory, "create", _recording_create)
+
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(work_dir))).scan([archive])
+
+    assert not result.warnings
+    assert "deep.txt" in {e.name for e in result.entries}  # nested archive was scanned
+    assert len(extracted_to) == 1
+    assert work_dir in extracted_to[0].parents  # ...and unpacked inside the chosen folder
+    assert list(work_dir.iterdir()) == []  # nothing is left behind
+
+
+def test_unusable_temp_dir_falls_back_to_system_temp(tmp_path: Path) -> None:
+    archive = tmp_path / "outer.7z"
+    _make_7z_with_nested_zip(archive)
+    missing = tmp_path / "no_such_folder"
+
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(missing))).scan([archive])
+
+    assert "deep.txt" in {e.name for e in result.entries}  # the scan still completes
+    assert len(result.warnings) == 1
+    assert result.warnings[0].path == str(missing)
+    assert "지정한 임시 폴더를 사용할 수 없어" in result.warnings[0].reason
+    assert not missing.exists()
+
+
+def test_temp_dir_problem(tmp_path: Path) -> None:
+    a_file = tmp_path / "file.txt"
+    a_file.write_bytes(b"x")
+
+    assert scanner_module.temp_dir_problem(tmp_path) is None
+    assert scanner_module.temp_dir_problem(tmp_path / "missing") is not None
+    assert scanner_module.temp_dir_problem(a_file) is not None
+    assert list(tmp_path.iterdir()) == [a_file]  # the probe file is removed
 
 
 def _nested_names(result) -> set[str]:
     return {e.name for e in result.entries}
 
 
-def test_custom_temp_dir_is_used_and_cleaned_up(tmp_path: Path, monkeypatch) -> None:
-    """Nested archives are unpacked in ScanOptions.temp_dir, which is left empty afterwards."""
-    data = tmp_path / "data"
-    data.mkdir()
-    _make_7z_with_nested_zip(data / "outer.7z")  # nested zip is extracted by py7zr
-    inner = io.BytesIO()
-    with zipfile.ZipFile(inner, "w") as zf:
-        zf.writestr("spooled.txt", b"spooled")
-    with zipfile.ZipFile(data / "outer.zip", "w") as zf:  # nested zip is spooled from a stream
-        zf.writestr("inner2.zip", inner.getvalue())
-    work = tmp_path / "work"
-    work.mkdir()
-
-    temp_files: list[Path] = []
-    real_cleanup = ScanEngine._safe_cleanup
-
-    def _record_cleanup(self, path: Path) -> None:
-        if path.is_file():
-            temp_files.append(path)
-        real_cleanup(self, path)
-
-    monkeypatch.setattr(ScanEngine, "_safe_cleanup", _record_cleanup)
-
-    # max_memory_archive_bytes=0: nothing is kept in memory, every nested archive goes to disk
-    options = ScanOptions(max_workers=2, max_memory_archive_bytes=0, temp_dir=str(work))
-    result = ScanEngine(options).scan([data])
-
-    assert not result.warnings
-    assert {"deep.txt", "spooled.txt"} <= _nested_names(result)
-    assert len(temp_files) == 2
-    for path in temp_files:
-        assert path.parent.parent == work  # <temp_dir>/deeplister_xxxx/nested….bin
-        assert path.parent.name.startswith("deeplister_")
-    assert list(work.iterdir()) == []
-
-
-def test_unusable_temp_dir_falls_back_to_system_temp_with_warning(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_unwritable_temp_dir_falls_back_to_system_temp(tmp_path: Path, monkeypatch) -> None:
+    """A folder that exists but refuses new entries (ACL, read-only share) is reported at once."""
     archive = tmp_path / "outer.7z"
     _make_7z_with_nested_zip(archive)
-
-    # 1) The folder does not exist (drive unplugged, typo in --temp-dir, ...)
-    missing = tmp_path / "no_such_folder"
-    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(missing))).scan([archive])
-    assert "deep.txt" in _nested_names(result)  # scanned anyway, in the system temp folder
-    assert [w.path for w in result.warnings] == [str(missing)]
-    assert "시스템 기본 임시 폴더" in result.warnings[0].reason
-    assert "폴더를 찾을 수 없습니다" in result.warnings[0].reason
-    assert not missing.exists()
-    assert scanner_module.temp_dir_problem(missing) == "폴더를 찾을 수 없습니다"
-
-    # 2) The folder exists but nothing can be created in it
     locked = tmp_path / "locked"
     locked.mkdir()
     real_mkdir = os.mkdir
@@ -489,16 +493,14 @@ def test_unusable_temp_dir_falls_back_to_system_temp_with_warning(
         return real_mkdir(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "mkdir", _deny_inside_locked)
-    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(locked))).scan([archive])
-    assert "deep.txt" in _nested_names(result)
-    assert [w.path for w in result.warnings] == [str(locked)]
-    assert "시스템 기본 임시 폴더" in result.warnings[0].reason
-    assert "폴더에 쓸 수 없습니다" in result.warnings[0].reason
-    assert list(locked.iterdir()) == []
 
-    # A usable folder reports no problem and the probe leaves nothing behind
-    monkeypatch.undo()
-    assert scanner_module.temp_dir_problem(locked) is None
+    assert "폴더에 쓸 수 없습니다" in scanner_module.temp_dir_problem(locked)
+    result = ScanEngine(ScanOptions(max_workers=2, temp_dir=str(locked))).scan([archive])
+
+    assert "deep.txt" in _nested_names(result)  # scanned anyway, in the system temp folder
+    assert [w.path for w in result.warnings] == [str(locked)]
+    assert "지정한 임시 폴더를 사용할 수 없어" in result.warnings[0].reason
+    assert "폴더에 쓸 수 없습니다" in result.warnings[0].reason
     assert list(locked.iterdir()) == []
 
 

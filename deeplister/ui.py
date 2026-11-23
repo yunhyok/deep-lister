@@ -14,6 +14,7 @@ from typing import Any
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QSettings,
     QSortFilterProxyModel,
     Qt,
     QThread,
@@ -76,6 +77,8 @@ from .scanner import (
 from .theme import apply_theme, assets_dir
 
 log = logging.getLogger("deeplister.ui")
+
+SETTINGS_KEY_TEMP_DIR = "scan/temp_dir"
 
 
 class FileEntryTableModel(QAbstractTableModel):
@@ -426,12 +429,19 @@ class DropZoneFrame(QFrame):
 class MainWindow(QMainWindow):
     """Main DeepLister desktop application window."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{__version__}")
         self.resize(1260, 820)
-        self.setMinimumSize(980, 680)  # height: room for the temp-folder row
+        self.setMinimumSize(980, 640)
         self.setAcceptDrops(True)
+
+        # Remembers the temp folder between runs; None keeps everything in memory (tests)
+        self._settings = settings
+        self._temp_dir: str | None = None  # None = system temp folder
+        if settings is not None:
+            saved = settings.value(SETTINGS_KEY_TEMP_DIR, "")
+            self._temp_dir = str(saved) if saved else None
 
         self._input_paths: list[str] = []
         self._last_result: ScanResult | None = None
@@ -441,7 +451,6 @@ class MainWindow(QMainWindow):
         self._is_exporting = False
         self._last_export_path: Path | None = None
         self._scan_log_offset = 0
-        self._temp_dir: str | None = None  # None = system temp directory
 
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
@@ -450,7 +459,6 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         apply_theme(self)
-        self._refresh_temp_dir()
         self._update_button_states()
 
     def _build_ui(self) -> None:
@@ -592,28 +600,38 @@ class MainWindow(QMainWindow):
         opt_row.addWidget(self.spin_depth)
         opt_outer.addLayout(opt_row)
 
-        # Temp work folder: nested archives are unpacked here before they can be listed
+        # Temp work folder: where nested archives are unpacked before they can be listed
         temp_row = QHBoxLayout()
         temp_row.setSpacing(8)
         lbl_temp = QLabel("임시 폴더:")
         lbl_temp.setProperty("muted", True)
+        temp_tip = (
+            "압축파일 안의 압축파일은 이 폴더에 잠시 풀어서 내부를 읽습니다.\n"
+            "스캔이 끝나면 자동으로 지워집니다. 용량이 큰 중첩 압축파일을 스캔할 때는\n"
+            "여유 공간이 충분한 드라이브의 폴더를 지정하세요."
+        )
+        lbl_temp.setToolTip(temp_tip)
         self.edit_temp_dir = QLineEdit()
         self.edit_temp_dir.setReadOnly(True)
-        self.lbl_temp_free = QLabel("")
-        self.lbl_temp_free.setProperty("muted", True)
+        self.edit_temp_dir.setToolTip(temp_tip)
+        self.lbl_temp_state = QLabel("")
+        self.lbl_temp_state.setProperty("muted", True)
         self.btn_temp_browse = QPushButton("변경...")
-        self.btn_temp_browse.setToolTip("여유 공간이 충분한 드라이브의 폴더를 임시 폴더로 지정합니다.")
+        self.btn_temp_browse.setToolTip("임시 폴더로 사용할 폴더를 선택합니다. 선택한 폴더는 다음 실행에도 유지됩니다.")
         self.btn_temp_browse.clicked.connect(self._choose_temp_dir)
         self.btn_temp_reset = QPushButton("기본값")
-        self.btn_temp_reset.setToolTip("시스템 기본 임시 폴더로 되돌립니다.")
+        self.btn_temp_reset.setToolTip("시스템 임시 폴더를 사용하도록 되돌립니다.")
+        # Bound method on purpose: a lambda capturing self forms a reference cycle that keeps
+        # the window alive until interpreter shutdown, where Qt then aborts the process
         self.btn_temp_reset.clicked.connect(self._reset_temp_dir)
 
         temp_row.addWidget(lbl_temp)
         temp_row.addWidget(self.edit_temp_dir, 1)
-        temp_row.addWidget(self.lbl_temp_free)
+        temp_row.addWidget(self.lbl_temp_state)
         temp_row.addWidget(self.btn_temp_browse)
         temp_row.addWidget(self.btn_temp_reset)
         opt_outer.addLayout(temp_row)
+        self._refresh_temp_dir_ui()
 
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
@@ -648,7 +666,6 @@ class MainWindow(QMainWindow):
         action_row.addSpacing(8)
         action_row.addWidget(self.btn_export)
         action_row.addWidget(self.chk_open_after_export)
-        action_row.addWidget(self.chk_save_log)
         action_row.addStretch(1)
 
         # Stats badges
@@ -687,8 +704,11 @@ class MainWindow(QMainWindow):
         self.btn_open_log_dir.setToolTip("로그 파일이 저장되는 폴더를 엽니다. (최근 30개 보관)")
         self.btn_open_log_dir.clicked.connect(self._open_log_dir)
 
+        # Log controls sit on this row because its path label can shrink; on the action row
+        # they would raise the window's minimum width once the stat badges show large numbers
         prog_row.addWidget(self.progress_bar)
         prog_row.addWidget(self.lbl_current_path, 1)
+        prog_row.addWidget(self.chk_save_log)
         prog_row.addWidget(self.btn_open_log)
         prog_row.addWidget(self.btn_open_log_dir)
         opt_outer.addLayout(prog_row)
@@ -761,6 +781,9 @@ class MainWindow(QMainWindow):
         self.warning_view.setColumnWidth(1, 540)
 
         self.tabs.addTab(self.warning_view, "경고 및 오류 (0)")
+        # Let the tables give up height first so the window still fits a 768-pixel-high screen
+        self.table_view.setMinimumHeight(40)
+        self.warning_view.setMinimumHeight(40)
         bottom_layout.addWidget(self.tabs, 1)
 
         splitter.addWidget(bottom_widget)
@@ -875,6 +898,57 @@ class MainWindow(QMainWindow):
     def _is_busy(self) -> bool:
         return self._is_scanning or self._is_exporting
 
+    def temp_dir(self) -> str | None:
+        """Custom temp work folder, or None when the system temp folder is used."""
+        return self._temp_dir
+
+    def set_temp_dir(self, path: str | None, persist: bool = True) -> bool:
+        """Select the temp work folder (None = system default); False if it is unusable."""
+        if self._is_busy():
+            return False
+        if path:
+            path = os.path.abspath(path)
+            problem = temp_dir_problem(path)
+            if problem is not None:
+                log.warning("임시 폴더로 사용할 수 없음: %s | %s", path, problem)
+                self.status_bar.showMessage(f"임시 폴더로 사용할 수 없습니다: {path} — {problem}")
+                return False
+        self._temp_dir = path or None
+        if persist and self._settings is not None:
+            self._settings.setValue(SETTINGS_KEY_TEMP_DIR, self._temp_dir or "")
+            self._settings.sync()
+        log.info("임시 폴더 설정: %s", self._temp_dir or f"기본값({tempfile.gettempdir()})")
+        self._refresh_temp_dir_ui()
+        self._update_button_states()
+        return True
+
+    def _reset_temp_dir(self) -> None:
+        self.set_temp_dir(None)
+
+    def _choose_temp_dir(self) -> None:
+        if self._is_busy():
+            return
+        start = self._temp_dir or tempfile.gettempdir()
+        folder = QFileDialog.getExistingDirectory(self, "임시 폴더 선택", start)
+        if folder and not self.set_temp_dir(folder):
+            QMessageBox.warning(
+                self,
+                "임시 폴더",
+                f"이 폴더는 임시 폴더로 사용할 수 없습니다:\n{folder}\n\n"
+                "폴더가 있고 쓰기가 가능한지 확인하세요.",
+            )
+
+    def _refresh_temp_dir_ui(self) -> None:
+        effective = self._temp_dir or tempfile.gettempdir()
+        self.edit_temp_dir.setText(effective)
+        self.edit_temp_dir.setCursorPosition(0)
+        kind = "사용자 지정" if self._temp_dir else "기본값"
+        if self._temp_dir and temp_dir_problem(self._temp_dir) is not None:
+            # e.g. a removable drive that is not connected: the scan falls back and warns
+            self.lbl_temp_state.setText(f"{kind} · 사용할 수 없음 (스캔 시 기본 폴더 사용)")
+        else:
+            self.lbl_temp_state.setText(f"{kind} · 여유 {logsetup.free_space_text(effective)}")
+
     def _update_button_states(self) -> None:
         busy = self._is_busy()
         has_inputs = len(self._input_paths) > 0
@@ -896,73 +970,13 @@ class MainWindow(QMainWindow):
         self.chk_include_empty_dirs.setEnabled(not busy)
         self.spin_threads.setEnabled(not busy)
         self.spin_depth.setEnabled(not busy and scan_arc_enabled)
-        self.edit_temp_dir.setEnabled(not busy and scan_arc_enabled)
         self.btn_temp_browse.setEnabled(not busy and scan_arc_enabled)
-        self.btn_temp_reset.setEnabled(
-            not busy and scan_arc_enabled and self._temp_dir is not None
-        )
+        self.btn_temp_reset.setEnabled(not busy and scan_arc_enabled and self._temp_dir is not None)
 
         logging_on = logsetup.current_log_path() is not None
         self.chk_save_log.setEnabled(logging_on and not busy)
         self.btn_open_log.setEnabled(logging_on)
         self.btn_open_log_dir.setEnabled(logging_on)
-
-    def set_temp_dir(self, path: str | None) -> None:
-        """Select the folder nested archives are unpacked in; None restores the system default."""
-        self._temp_dir = os.path.abspath(path) if path else None
-        log.info("임시 폴더 설정: %s", self._temp_dir or "시스템 기본")
-        self._refresh_temp_dir()
-        self._update_button_states()
-
-    def _reset_temp_dir(self) -> None:
-        # A bound-method slot: a lambda capturing self would keep the window alive in a
-        # reference cycle until interpreter shutdown, where Qt teardown then crashes
-        self.set_temp_dir(None)
-
-    def _refresh_temp_dir(self) -> None:
-        """Show the temp folder in use and the free space of its drive."""
-        folder = self._temp_dir or tempfile.gettempdir()
-        self.edit_temp_dir.setText(folder)
-        self.edit_temp_dir.setCursorPosition(0)  # keep the drive visible when the path is long
-        usable = os.path.isdir(folder)
-        self.lbl_temp_free.setText(
-            f"여유 {logsetup.free_space_text(folder)}" if usable else "폴더 없음"
-        )
-        tip = (
-            "압축파일 안의 중첩 압축파일을 풀어 두는 임시 작업 폴더입니다. "
-            "스캔이 끝나면 자동으로 비워집니다.\n"
-            "공간이 모자라면 중첩 압축파일 내부를 탐색하지 못하므로, "
-            "여유 공간이 충분한 드라이브의 폴더로 바꾸세요.\n\n"
-            f"{'사용자 지정' if self._temp_dir else '시스템 기본'}: {folder}"
-        )
-        if not usable:
-            tip += "\n폴더를 찾을 수 없어 스캔할 때 시스템 기본 임시 폴더를 대신 사용합니다."
-        self.edit_temp_dir.setToolTip(tip)
-        self.lbl_temp_free.setToolTip(tip)
-
-    def _choose_temp_dir(self) -> None:
-        if self._is_busy():
-            return
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "중첩 압축파일을 풀 임시 폴더 선택",
-            self._temp_dir or tempfile.gettempdir(),
-        )
-        if not folder:
-            return
-        folder = os.path.abspath(folder)
-        problem = temp_dir_problem(folder)
-        if problem is not None:
-            QMessageBox.warning(
-                self,
-                "임시 폴더",
-                f"이 폴더는 임시 폴더로 사용할 수 없습니다:\n{folder}\n\n{problem}",
-            )
-            return
-        self.set_temp_dir(folder)
-        self.status_bar.showMessage(
-            f"임시 폴더를 변경했습니다: {folder} ({self.lbl_temp_free.text()})"
-        )
 
     def _open_log_file(self) -> None:
         path = logsetup.current_log_path()
@@ -1066,6 +1080,7 @@ class MainWindow(QMainWindow):
         self.lbl_current_path.setText(msg)
         self.status_bar.showMessage(msg)
         self._apply_filter_now()
+        self._refresh_temp_dir_ui()  # free space may have changed
         self._update_button_states()
 
     def _on_scan_failed(self, error_msg: str) -> None:
@@ -1084,7 +1099,6 @@ class MainWindow(QMainWindow):
         self._is_scanning = False
         if thread is not None:
             thread.deleteLater()
-        self._refresh_temp_dir()  # free space may have changed
         self._update_button_states()
 
     def _on_filter_text_changed(self, _text: str) -> None:
@@ -1241,9 +1255,13 @@ def run_gui(
     logsetup.start_file_logging(log_dir)
     logsetup.install_exception_hooks()
     try:
-        window = MainWindow()
+        settings = QSettings(
+            str(logsetup.app_data_dir() / "settings.ini"), QSettings.Format.IniFormat
+        )
+        window = MainWindow(settings)
         if temp_dir:
-            window.set_temp_dir(temp_dir)
+            # Command-line choice applies to this run only; the saved setting is left alone
+            window.set_temp_dir(temp_dir, persist=False)
         if initial_paths:
             window.add_paths(initial_paths)
 

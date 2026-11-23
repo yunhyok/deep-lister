@@ -32,7 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--temp-dir",
         metavar="DIR",
-        help="중첩 압축파일을 풀 임시 작업 폴더 (기본: 시스템 임시 폴더)",
+        help="중첩 압축파일을 풀 임시 폴더 (이번 실행에만 적용, 기본: 저장된 설정 또는 시스템 임시 폴더)",
     )
     parser.add_argument(
         "--version",
