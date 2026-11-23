@@ -13,7 +13,7 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .models import FileEntry, ScanResult, format_datetime, format_size
+from .models import SOURCE_LABELS, FileEntry, ScanResult, format_datetime, format_size
 
 # Excel allows 1,048,576 rows per sheet (1 header + 1,048,575 data rows)
 MAX_DATA_ROWS_PER_SHEET = 1_048_575
@@ -51,9 +51,16 @@ COLUMNS = [
     ("생성 날짜", 21, 23, "center"),
     ("수정된 날짜", 21, 23, "center"),
     ("용량 (Bytes)", 15, 20, "right"),
-    ("용량", 13, 18, "right"),
     ("구분", 16, 26, "center"),
 ]
+
+
+# Shown under the created-date table whenever some entries have no creation timestamp
+CREATED_MISSING_NOTE = (
+    "※ 생성 날짜가 빈 항목은 원본에 생성 시각이 저장되어 있지 않은 경우입니다.",
+    "   7z는 압축할 때 생성 시각 저장 옵션(-mtc=on)을 켜야 생성 시각이 기록되며,",
+    "   기본 설정으로 만든 7z에는 수정 시각만 들어 있습니다.",
+)
 
 
 def sanitize_excel_text(value: str) -> str:
@@ -115,7 +122,6 @@ def _compute_column_widths(entries: list[FileEntry]) -> list[int]:
             format_datetime(entry.created_at),
             format_datetime(entry.modified_at),
             f"{entry.size:,}",
-            format_size(entry.size),
             entry.kind_label,
         )
         for col_idx, text in enumerate(row_samples):
@@ -189,7 +195,6 @@ def _write_entries_sheets(wb: Workbook, entries: list[FileEntry]) -> None:
                     fill=fill,
                     number_format="#,##0",
                 ),
-                _make_cell(ws, format_size(entry.size), alignment=ALIGN_RIGHT, fill=fill),
                 _make_cell(ws, entry.kind_label, alignment=ALIGN_CENTER, fill=fill),
             ]
             ws.append(row_cells)
@@ -214,6 +219,9 @@ def _write_summary_sheet(wb: Workbook, result: ScanResult) -> None:
         ("탐색한 압축 파일 수", f"{stats.archives_scanned:,} 개"),
         ("압축 내부 파일 수", f"{stats.archive_members:,} 개"),
         ("빈 폴더 수", f"{stats.directories:,} 개"),
+        ("생성 날짜 기록 항목 수", f"{stats.created_present:,} 개"),
+        ("생성 날짜 없는 항목 수", f"{stats.created_missing:,} 개"),
+        ("생성 시각 미저장 압축파일 수", f"{stats.archives_without_created:,} 개"),
         ("총 용량 (Bytes)", stats.total_size),
         ("총 용량 (표시)", format_size(stats.total_size)),
         ("최대 압축 중첩 깊이", f"{stats.max_depth_seen} 단계"),
@@ -222,6 +230,8 @@ def _write_summary_sheet(wb: Workbook, result: ScanResult) -> None:
         ("경고 / 오류 수", f"{len(result.warnings):,} 건"),
         ("완료 상태", "사용자 중지됨" if stats.cancelled else "정상 완료"),
     ]
+    if stats.log_path:
+        summary_rows.append(("로그 파일", stats.log_path))
 
     for label, val in summary_rows:
         c_key = _make_cell(ws_sum, label, font=BOLD_FONT, alignment=ALIGN_LEFT, fill=SUMMARY_KEY_FILL)
@@ -230,6 +240,38 @@ def _write_summary_sheet(wb: Workbook, result: ScanResult) -> None:
         else:
             c_val = _make_cell(ws_sum, str(val), alignment=ALIGN_LEFT)
         ws_sum.append([c_key, c_val])
+
+    if stats.created_by_source:
+        ws_sum.append([])
+        cov_cell = WriteOnlyCell(ws_sum, value="생성 날짜 기록 현황")
+        cov_cell.font = BOLD_FONT
+        ws_sum.append([cov_cell])
+        ws_sum.append(
+            [
+                _make_cell(
+                    ws_sum, "원본", font=HEADER_FONT, alignment=ALIGN_CENTER, fill=SUBHEADER_FILL
+                ),
+                _make_cell(
+                    ws_sum,
+                    "생성 날짜 기록됨 / 전체 항목",
+                    font=HEADER_FONT,
+                    alignment=ALIGN_CENTER,
+                    fill=SUBHEADER_FILL,
+                ),
+            ]
+        )
+        for source, (present, total) in stats.created_by_source.items():
+            ws_sum.append(
+                [
+                    _make_cell(ws_sum, SOURCE_LABELS.get(source, source), alignment=ALIGN_LEFT),
+                    _make_cell(ws_sum, f"{present:,} / {total:,} 개", alignment=ALIGN_LEFT),
+                ]
+            )
+        if stats.created_missing:
+            for line in CREATED_MISSING_NOTE:
+                note_cell = WriteOnlyCell(ws_sum, value=line)
+                note_cell.font = BODY_FONT
+                ws_sum.append([note_cell])
 
     ws_sum.append([])
     sec_cell = WriteOnlyCell(ws_sum, value="스캔 입력 대상")

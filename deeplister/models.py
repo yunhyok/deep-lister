@@ -14,6 +14,31 @@ class EntryKind(str, Enum):
     DIRECTORY = "폴더"
 
 
+# Where an entry's metadata was read from (drives the created-date statistics)
+SOURCE_FILESYSTEM = "fs"
+SOURCE_ZIP = "zip"
+SOURCE_7Z = "7z"
+SOURCE_TAR = "tar"
+
+SOURCE_LABELS = {
+    SOURCE_FILESYSTEM: "파일 시스템",
+    SOURCE_ZIP: "ZIP 내부",
+    SOURCE_7Z: "7z 내부",
+    SOURCE_TAR: "TAR 내부",
+}
+
+# Why a created date can legitimately be empty, per metadata source
+CREATED_MISSING_HINTS = {
+    SOURCE_FILESYSTEM: "파일 시스템이 생성 시각을 제공하지 않았습니다.",
+    SOURCE_ZIP: "이 ZIP 항목에는 생성 시각(NTFS/UT 확장 필드)이 저장되어 있지 않습니다.",
+    SOURCE_7Z: (
+        "이 7z 압축파일에는 생성 시각이 저장되어 있지 않습니다. "
+        "(7-Zip 기본 설정은 수정 시각만 저장합니다)"
+    ),
+    SOURCE_TAR: "TAR 형식은 생성 시각을 저장하지 않습니다.",
+}
+
+
 @dataclass(slots=True)
 class FileEntry:
     """Single discovered file or folder entry."""
@@ -25,6 +50,7 @@ class FileEntry:
     size: int
     kind: EntryKind = EntryKind.FILE
     archive_depth: int = 0
+    source: str = SOURCE_FILESYSTEM
 
     @property
     def kind_label(self) -> str:
@@ -75,6 +101,12 @@ class ScanStats:
     cancelled: bool = False
     worker_count: int = 1
     input_paths: list[str] = field(default_factory=list)
+    # Created-date coverage: how many entries carry a creation timestamp, overall and per source
+    created_present: int = 0
+    created_missing: int = 0
+    created_by_source: dict[str, tuple[int, int]] = field(default_factory=dict)  # (present, total)
+    archives_without_created: int = 0
+    log_path: str = ""
 
 
 @dataclass
